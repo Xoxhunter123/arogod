@@ -16,6 +16,18 @@ from curl_cffi.requests import AsyncSession
 import telebot
 from telebot import types
 
+# Ensure UTF-8 output encoding across Windows / Linux consoles
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -368,13 +380,16 @@ def normalize(link):
     u = (link or "").strip()
     if not u:
         return None, None
-    m = re.match(r"https?://(?:link\.|m\.)?vipshort\.in/(.+?)/?$", u)
+    m = re.match(r"(?:https?://)?(?:link\.|m\.)?vipshort\.in/(.+?)/?$", u, re.I)
     if m:
         return "vipshort", f"https://link.vipshort.in/{m.group(1)}"
-    m = re.match(r"https?://(?:www\.)?arolinks\.com/(.+?)/?$", u)
+    m = re.match(r"(?:https?://)?(?:www\.)?arolinks\.com/(.+?)/?$", u, re.I)
     if m:
         return "arolinks", f"https://arolinks.com/{m.group(1)}"
-    m = re.match(r"https?://(?:www\.)?dupload\.(?:net|xyz)/(.+?)/?$", u)
+    m = re.match(r"(?:https?://)?(?:www\.)?vplinks?\.in/(.+?)/?$", u, re.I)
+    if m:
+        return "vplink", f"https://vplink.in/{m.group(1)}"
+    m = re.match(r"(?:https?://)?(?:www\.)?dupload\.(?:net|xyz)/(.+?)/?$", u, re.I)
     if m:
         return "dupload", f"https://dupload.net/{m.group(1)}"
     if "/" not in u and "." not in u:
@@ -431,6 +446,8 @@ def walk_vipshort(s, short_url, notify):
 def js_hop(html):
     m = (re.search(r'(?:window|document)\.location\.href\s*=\s*[\'"]([^\'"]+)[\'"]', html)
          or re.search(r'<meta[^>]+http-equiv="refresh"[^>]+url=([^\'">]+)', html, re.I))
+    if not m and "h1 style" in html and "Opening Link" in html:
+        m = re.search(r'href="([^"]+)"', html)
     return m.group(1).strip() if m else None
 
 
@@ -457,8 +474,8 @@ def walk_arolinks(s, short_url, notify):
         # If on arolinks.com and no js_hop found, do NOT hit /readmore/ on arolinks
         if "arolinks.com" in host:
             if r.status_code in (403, 503) or "just a moment" in r.text.lower() or "challenge" in r.text.lower():
-                notify(f"[aro] ⚠️ Cloudflare Challenge on Render IP (HTTP {r.status_code})")
-                raise RuntimeError("Cloudflare blocked Render's datacenter IP. Set 'PROXY' in Render Environment Variables or send '<url> <proxy>'.")
+                notify(f"[aro] ⚠️ Cloudflare Challenge on Cloud IP (HTTP {r.status_code})")
+                raise RuntimeError("Cloudflare blocked datacenter IP. Send '<url> <proxy>' to use a custom proxy.")
 
             # Check for fallback click here anchor
             anchor_m = re.search(r'<a[^>]+href=[\'"](https?://[^\'"]+)[\'"][^>]*>\s*(?:click here|open link|continue)', r.text, re.I)
@@ -467,8 +484,8 @@ def walk_arolinks(s, short_url, notify):
                 time.sleep(random.uniform(0.9, 2.2))
                 continue
 
-            notify(f"[aro] ⚠️ arolinks returned no redirect (HTTP {r.status_code}). IP blocked on Render.")
-            raise RuntimeError("arolinks IP blocked on Render. Add a PROXY in Render Environment Variables or send with proxy.")
+            notify(f"[aro] ⚠️ arolinks returned no redirect (HTTP {r.status_code}).")
+            raise RuntimeError("arolinks returned no redirect. The link may be dead or expired.")
 
         # Gateway article (hittracks, entiredust, etc.): forge cookie, hit /readmore/
         s.cookies.set("adcadg", ADCADG, domain=host)
@@ -552,15 +569,130 @@ def visit_final(s, url, host, notify):
         notify(f"[visit] final hop note: {str(e)[:60]}")
 
 
-def bypass_process(link, explicit_proxy=None, status_cb=None):
+def extract_vplink_destination(html):
+    # 1. Primary: vplink.in custom direct "gt-link" anchor
+    m = re.search(r'<a[^>]+id=[\'"]gt-link[\'"][^>]*href=[\'"]([^\'"]+)[\'"]', html)
+    if not m:
+        m = re.search(r'<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*id=[\'"]gt-link[\'"]', html)
+    if m and m.group(1).strip() and not m.group(1).startswith("javascript:"):
+        return m.group(1).strip()
+
+    # 2. Secondary: any anchor with "Get link" text and non-javascript href
+    m = re.search(r'<a[^>]+href=[\'"]([^\'"]+)[\'"][^>]*>\s*Get link\s*</a>', html, re.I)
+    if m and m.group(1).strip() and not m.group(1).startswith("javascript:"):
+        return m.group(1).strip()
+
+    return None
+
+
+def kill_vplink(s, go_page, html, notify):
+    direct = extract_vplink_destination(html)
+    if direct:
+        notify(f"[vplink] direct destination found in page: {direct[:60]}...")
+        return direct
+
+    inputs = {}
+    for tag in re.finditer(r'<input[^>]+>', html):
+        t = tag.group(0)
+        n = re.search(r'name="([^"]+)"', t)
+        v = re.search(r'value="([^"]*)"', t)
+        if n:
+            inputs[n.group(1)] = v.group(1) if v else ""
+
+    if "ad_form_data" not in inputs:
+        raise RuntimeError("go form missing ad_form_data — page layout changed?")
+    notify(f"[vplink] harvested go form ({len(inputs)} fields)")
+
+    s.cookies.set("ab", "2", domain="vplink.in")
+    if inputs.get("_csrfToken"):
+        s.cookies.set("csrfToken", inputs["_csrfToken"], domain="vplink.in")
+
+    notify("[vplink] waiting out 5s counter...")
+    time.sleep(5.2)
+
+    payload = dict(inputs)
+    payload["_method"] = "POST"
+    r = s.post("https://vplink.in/links/go", data=payload, headers={
+        "Origin": "https://vplink.in",
+        "Referer": go_page,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest"
+    }, timeout=25)
+
+    j = r.json() if r.text.strip().startswith("{") else {}
+    if j.get("status") != "success" or not j.get("url"):
+        raise RuntimeError(f"links/go failed: {r.text[:140]}")
+    return j["url"]
+
+
+def walk_vplink(s, short_url, notify):
+    url = short_url
+    referer = short_url
+    articles = 0
+
+    for step in range(35):
+        m_host = re.search(r"https?://([^/]+)", url)
+        host = m_host.group(1) if m_host else ""
+        notify(f"[vplink] hop {step}: [{host}] {url[:65]}")
+
+        r = s.get(url, timeout=25, headers={"Referer": referer})
+        referer = r.url
+        m_host = re.search(r"https?://([^/]+)", r.url)
+        host = m_host.group(1) if m_host else host
+
+        # Check if vplink served the go form or direct destination
+        if "vplink.in" in host:
+            if "ad_form_data" in r.text and step > 0:
+                notify(f"[vplink] go form served on vplink.in at hop {step}")
+                return r.url, r.text
+            direct = extract_vplink_destination(r.text)
+            if direct and step > 0:
+                notify(f"[vplink] direct destination found at hop {step}")
+                return r.url, r.text
+            notify(f"[vplink] {step}: vplink bounce / initial")
+
+        # Check for JS trampoline redirect
+        m = js_hop(r.text)
+        if m:
+            target = urljoin(r.url, m)
+            if target.rstrip('/') != r.url.rstrip('/'):
+                notify(f"[vplink] js -> {target[:65]}")
+                url = target
+                time.sleep(random.uniform(1.2, 2.0))
+                continue
+
+        # Gateway article page
+        articles += 1
+        s.cookies.set("adcadg", ADCADG, domain=host)
+        if "entiredust" in host:
+            s.cookies.set("_uocat", "value", domain=host)
+
+        # Look for learn_more link
+        m_lm = re.search(r'href="([^"]*learn_more\.php[^"]*)"', r.text)
+        if m_lm:
+            learn_more_target = urljoin(r.url, m_lm.group(1))
+        elif "entiredust" in host:
+            learn_more_target = f"https://{host}/studyscholorhiipss/learn_more.php"
+        else:
+            learn_more_target = f"https://{host}/learn_more.php"
+
+        notify(f"[vplink] article #{articles} on {host} -> wait 5.5s")
+        time.sleep(5.5)
+        url = learn_more_target
+
+    raise RuntimeError("vplink walk exceeded max hops without finding go form or destination")
+
+
+def bypass_process(link, explicit_proxy=None, proxy_url=None, status_cb=None):
     def notify(msg):
         print(msg, flush=True)
         if status_cb:
             status_cb(msg)
 
+    explicit_proxy = explicit_proxy or proxy_url
     family, short = normalize(link)
     if family is None:
-        raise RuntimeError(f"unrecognized link (not vipshort/arolinks): {short[:60]}")
+        raise RuntimeError(f"unrecognized link (supported: vipshort, arolinks, vplink, dupload): {short[:60]}")
 
     chosen_proxy = None
     used_from_pool = False
@@ -582,7 +714,7 @@ def bypass_process(link, explicit_proxy=None, status_cb=None):
             else:
                 notify("[vip] ℹ️ No proxies in pool — running direct...")
     else:
-        # arolinks & dupload: STRICTLY DIRECT! No pool proxy is used!
+        # arolinks, vplink & dupload: STRICTLY DIRECT! No pool proxy is used!
         if explicit_proxy:
             chosen_proxy = parse_proxy_any(explicit_proxy)
             notify(f"[{family[:3]}] 🛡️ Using explicit proxy: {mask_proxy(chosen_proxy)}")
@@ -605,6 +737,10 @@ def bypass_process(link, explicit_proxy=None, status_cb=None):
             visit_final(s, final, "m.vipshort.in", notify)
         elif family == "dupload":
             final = bypass_dupload(s, short, notify)
+        elif family == "vplink":
+            go_page, html = walk_vplink(s, short, notify)
+            final = kill_vplink(s, go_page, html, notify)
+            visit_final(s, final, "vplink.in", notify)
         else:
             go_page, html = walk_arolinks(s, short, notify)
             notify(f"[aro] go page: {go_page[:70]}")
@@ -792,6 +928,7 @@ def setup_bot(token: str):
             f"╭─ 💎 <b>Supported Networks</b>\n"
             f"├ 🌐 <code>arolinks.com</code> (multi-lap gateway — direct)\n"
             f"├ 🔗 <code>vipshort.in</code> (classic + search-hop — proxied)\n"
+            f"├ ⚡ <code>vplink.in / vplinks.in</code> (multi-hop gateway — direct)\n"
             f"╰ 📦 <code>dupload.net / xyz</code> (direct CDN)\n\n"
             f"╭─ 🛡️ <b>Proxy Management</b>\n"
             f"├ ➕ <code>/addproxy &lt;proxy&gt;</code> - Check & add live proxy\n"
@@ -833,7 +970,7 @@ def setup_bot(token: str):
         masked = mask_proxy(parsed)
         status_msg = bot.reply_to(
             msg,
-            f"╭━━━━〔 🔍 <b>PROXY CHECK</b> 〕━━━━╮\n\n"
+            f"╭━━━━〔 🔍 <b>ASYNC PROXY CHECK</b> 〕━━━━╮\n\n"
             f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
             f"⏳ <i>Testing connectivity, latency & rotation async...</i>\n\n"
             f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
@@ -1068,7 +1205,7 @@ def setup_bot(token: str):
         custom_proxy = None
 
         for token in tokens:
-            if "http://" in token or "https://" in token or "arolinks.com" in token or "vipshort.in" in token:
+            if any(d in token.lower() for d in ("http://", "https://", "arolinks.com", "vipshort.in", "vplink.in", "vplinks.in", "dupload")):
                 target_link = token
                 break
 
@@ -1132,7 +1269,7 @@ def main():
         print("[!] ERROR: Telegram BOT_TOKEN is required!", file=sys.stderr)
         print("    Set it in your environment: export BOT_TOKEN='your_bot_token'", file=sys.stderr)
         print("    Or pass it via argument:   python bot.py --token 'your_bot_token'", file=sys.stderr)
-        print("    On Render: Add BOT_TOKEN in Environment Variables.", file=sys.stderr)
+        print("    On Railway: Add BOT_TOKEN in Environment Variables.", file=sys.stderr)
         sys.exit(1)
 
     # Start cloud health server on $PORT if assigned (Railway web service)
