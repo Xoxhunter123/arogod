@@ -1,16 +1,6 @@
-#!/usr/bin/env python3
-"""
-bot.py — Telegram Bot & Link Bypass Engine
-Supports:
-  • vipshort.in (classic funnel + search-hop variant)
-  • arolinks.com (multi-lap gateway countdowns)
-  • dupload.net / dupload.xyz (direct CDN unwrap)
-
-Render Hosting:
-  Runs on Render as Web Service (built-in $PORT health server) or Background Worker.
-"""
-
 import argparse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
@@ -22,6 +12,7 @@ import time
 from urllib.parse import quote, unquote, urljoin
 
 from curl_cffi import requests as cr
+from curl_cffi.requests import AsyncSession
 import telebot
 from telebot import types
 
@@ -123,6 +114,254 @@ def parse_proxy_any(spec):
     if len(parts) == 1 and parts[0]:
         return f"{scheme}://{parts[0]}:8080"
     return None
+
+
+def mask_proxy(p: str) -> str:
+    if not p:
+        return "None"
+    m = re.match(r"^(https?|socks[45]h?)://([^:]+):([^@]+)@(.+)$", p)
+    if m:
+        return f"{m.group(1)}://{m.group(2)}:***@{m.group(4)}"
+    return p
+
+
+def make_progress_bar(current: int, total: int, length: int = 10) -> str:
+    if total <= 0:
+        return "[░░░░░░░░░░]"
+    filled = max(0, min(length, int(length * (current / total))))
+    return f"[{'█' * filled}{'░' * (length - filled)}]"
+
+
+async def async_check_proxy(proxy_url: str, timeout: int = 5) -> dict:
+    """
+    Asynchronously probes proxy connectivity, latency, protocol, and detects
+    whether the exit IP is Rotating or Static.
+    """
+    parsed = parse_proxy_any(proxy_url)
+    if not parsed:
+        return {"live": False, "reason": "Invalid format", "proxy": proxy_url}
+
+    protocol = "SOCKS5" if "socks5" in parsed.lower() else "HTTP"
+    t0 = time.perf_counter()
+    try:
+        async with AsyncSession(
+            impersonate="chrome131",
+            proxies={"http": parsed, "https": parsed},
+            verify=False
+        ) as s:
+            r1 = await s.get("https://api.ipify.org?format=json", timeout=timeout)
+            latency = time.perf_counter() - t0
+            if r1.status_code != 200:
+                return {"live": False, "reason": f"HTTP {r1.status_code}", "proxy": parsed, "latency": latency}
+
+            ip1 = r1.json().get("ip", "") if "{" in r1.text else r1.text.strip()
+
+            # Second probe to test if IP rotates
+            proxy_type = "Static"
+            try:
+                r2 = await s.get("https://api.ipify.org?format=json", timeout=timeout)
+                ip2 = r2.json().get("ip", "") if "{" in r2.text else r2.text.strip()
+                if ip1 and ip2 and ip1 != ip2:
+                    proxy_type = "Rotating"
+            except Exception:
+                pass
+
+            return {
+                "live": True,
+                "proxy": parsed,
+                "type": proxy_type,
+                "protocol": protocol,
+                "ip": ip1,
+                "latency": latency
+            }
+    except Exception as e:
+        latency = time.perf_counter() - t0
+        err = str(e)
+        if "Failed to connect" in err or "Connection refused" in err:
+            err = "Connection Refused / Offline"
+        elif "timed out" in err or "Timeout" in err:
+            err = "Connection Timed Out"
+        elif "Proxy" in err:
+            err = "Proxy Handshake Error"
+        else:
+            err = err[:35]
+        return {"live": False, "reason": err, "proxy": parsed, "latency": latency}
+
+
+def check_proxy_live(proxy_url: str, timeout: int = 5) -> dict:
+    """Sync wrapper for async_check_proxy."""
+    try:
+        return asyncio.run(async_check_proxy(proxy_url, timeout=timeout))
+    except Exception as e:
+        return {"live": False, "reason": str(e)[:35], "proxy": proxy_url, "latency": 0.0}
+
+
+class ProxyManager:
+    """Thread-safe proxy pool with persistence and Static/Rotating metadata."""
+    def __init__(self, txt_path="proxies.txt", json_path="proxies.json"):
+        self.txt_path = txt_path
+        self.json_path = json_path
+        self.proxies = []
+        self.meta = {}
+        self.lock = threading.Lock()
+        self.load()
+
+    def load(self):
+        with self.lock:
+            self.proxies = []
+            self.meta = {}
+            if os.path.isfile(self.json_path):
+                try:
+                    with open(self.json_path, "r", encoding="utf-8") as f:
+                        self.meta = json.load(f)
+                except Exception:
+                    self.meta = {}
+
+            if os.path.isfile(self.txt_path):
+                try:
+                    with open(self.txt_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                parsed = parse_proxy_any(line)
+                                if parsed and parsed not in self.proxies:
+                                    self.proxies.append(parsed)
+                                    if parsed not in self.meta:
+                                        self.meta[parsed] = {"type": "Static", "latency": 0.0, "ip": ""}
+                    print(f"[*] Loaded {len(self.proxies)} proxies ({self.get_stats_unlocked()})", flush=True)
+                except Exception as e:
+                    print(f"[!] Could not load {self.txt_path}: {e}", flush=True)
+
+    def save(self):
+        try:
+            with open(self.txt_path, "w", encoding="utf-8") as f:
+                for p in self.proxies:
+                    f.write(f"{p}\n")
+            with open(self.json_path, "w", encoding="utf-8") as f:
+                json.dump(self.meta, f, indent=2)
+        except Exception as e:
+            print(f"[!] Warning saving proxy storage: {e}", flush=True)
+
+    def add(self, proxy_str: str, p_type: str = "Static", latency: float = 0.0, ip: str = "", protocol: str = "HTTP") -> bool:
+        parsed = parse_proxy_any(proxy_str)
+        if not parsed:
+            return False
+        with self.lock:
+            if parsed not in self.proxies:
+                self.proxies.append(parsed)
+            self.meta[parsed] = {
+                "type": p_type,
+                "latency": latency,
+                "ip": ip,
+                "protocol": protocol,
+                "updated_at": time.time()
+            }
+            self.save()
+            return True
+
+    def remove(self, proxy_str: str) -> bool:
+        parsed = parse_proxy_any(proxy_str) or proxy_str
+        with self.lock:
+            changed = False
+            if parsed in self.proxies:
+                self.proxies.remove(parsed)
+                changed = True
+            if parsed in self.meta:
+                del self.meta[parsed]
+                changed = True
+            if changed:
+                self.save()
+                return True
+        return False
+
+    def has(self, proxy_str: str) -> bool:
+        parsed = parse_proxy_any(proxy_str) or proxy_str
+        with self.lock:
+            return parsed in self.proxies
+
+    def get_random(self):
+        with self.lock:
+            if not self.proxies:
+                return None
+            # Prioritize rotating proxies if available
+            rotating = [p for p in self.proxies if self.meta.get(p, {}).get("type") == "Rotating"]
+            if rotating:
+                return random.choice(rotating)
+            return random.choice(self.proxies)
+
+    def count(self) -> int:
+        with self.lock:
+            return len(self.proxies)
+
+    def get_stats_unlocked(self) -> str:
+        total = len(self.proxies)
+        rotating = sum(1 for p in self.proxies if self.meta.get(p, {}).get("type") == "Rotating")
+        static = total - rotating
+        return f"{static} Static, {rotating} Rotating"
+
+    def get_stats(self) -> dict:
+        with self.lock:
+            total = len(self.proxies)
+            rotating = sum(1 for p in self.proxies if self.meta.get(p, {}).get("type") == "Rotating")
+            static = total - rotating
+            return {"total": total, "static": static, "rotating": rotating}
+
+    def get_all(self) -> list:
+        with self.lock:
+            return list(self.proxies)
+
+    def clear(self):
+        with self.lock:
+            self.proxies = []
+            self.meta = {}
+            self.save()
+
+
+proxy_manager = ProxyManager()
+
+
+async def async_scan_proxies_pipeline(proxy_list: list, max_concurrency: int = 25, on_progress=None):
+    """
+    High-performance async proxy pipeline with live statistics & progress bar.
+    """
+    sem = asyncio.Semaphore(max_concurrency)
+    total = len(proxy_list)
+    tested_count = 0
+    live_results = []
+    dead_results = []
+    lock = asyncio.Lock()
+    last_ui_update = 0.0
+
+    async def worker(p):
+        nonlocal tested_count, last_ui_update
+        async with sem:
+            res = await async_check_proxy(p, timeout=5)
+            async with lock:
+                tested_count += 1
+                if res.get("live"):
+                    live_results.append(res)
+                else:
+                    dead_results.append(res)
+
+                now = time.time()
+                if on_progress and (now - last_ui_update >= 1.5 or tested_count == total):
+                    last_ui_update = now
+                    static_count = sum(1 for r in live_results if r.get("type") == "Static")
+                    rotating_count = len(live_results) - static_count
+                    avg_lat = (sum(r.get("latency", 0.0) for r in live_results) / len(live_results)) if live_results else 0.0
+                    on_progress({
+                        "tested": tested_count,
+                        "total": total,
+                        "static": static_count,
+                        "rotating": rotating_count,
+                        "live": len(live_results),
+                        "dead": len(dead_results),
+                        "avg_latency": avg_lat,
+                    })
+
+    tasks = [worker(p) for p in proxy_list]
+    await asyncio.gather(*tasks)
+    return live_results, dead_results
 
 
 def normalize(link):
@@ -313,51 +552,90 @@ def visit_final(s, url, host, notify):
         notify(f"[visit] final hop note: {str(e)[:60]}")
 
 
-def bypass_process(link, proxy_url=None, status_cb=None):
+def bypass_process(link, explicit_proxy=None, status_cb=None):
     def notify(msg):
         print(msg, flush=True)
         if status_cb:
             status_cb(msg)
 
-    s, persona = build_session()
-    if proxy_url:
-        s.proxies = {"http": proxy_url, "https": proxy_url}
-
     family, short = normalize(link)
     if family is None:
         raise RuntimeError(f"unrecognized link (not vipshort/arolinks): {short[:60]}")
 
+    chosen_proxy = None
+    used_from_pool = False
+
+    # ONLY USE PROXY FOR VIPSHORT!
+    if family == "vipshort":
+        if explicit_proxy:
+            chosen_proxy = parse_proxy_any(explicit_proxy)
+            notify(f"[vip] 🛡️ Using explicit proxy: {mask_proxy(chosen_proxy)}")
+        else:
+            pool_proxy = proxy_manager.get_random()
+            if pool_proxy:
+                chosen_proxy = pool_proxy
+                used_from_pool = True
+                notify(f"[vip] 🛡️ Selected proxy from pool ({proxy_manager.count()} total): {mask_proxy(chosen_proxy)}")
+            elif os.environ.get("PROXY"):
+                chosen_proxy = parse_proxy_any(os.environ.get("PROXY"))
+                notify(f"[vip] 🛡️ Using env PROXY: {mask_proxy(chosen_proxy)}")
+            else:
+                notify("[vip] ℹ️ No proxies in pool — running direct...")
+    else:
+        # arolinks & dupload: STRICTLY DIRECT! No pool proxy is used!
+        if explicit_proxy:
+            chosen_proxy = parse_proxy_any(explicit_proxy)
+            notify(f"[{family[:3]}] 🛡️ Using explicit proxy: {mask_proxy(chosen_proxy)}")
+        else:
+            chosen_proxy = None
+            notify(f"[{family[:3]}] ⚡ Direct connection (proxy disabled for {family})")
+
+    s, persona = build_session()
+    if chosen_proxy:
+        s.proxies = {"http": chosen_proxy, "https": chosen_proxy}
+
     notify(f"[*] routing: {family} ({persona})")
 
-    if family == "vipshort":
-        go_page = walk_vipshort(s, short, notify)
-        notify(f"[vip] go page: {go_page[:70]}")
-        r = s.get(go_page, timeout=25, headers={"Referer": BLOG})
-        final = kill(s, go_page, r.text, host="m.vipshort.in", notify=notify)
-        visit_final(s, final, "m.vipshort.in", notify)
-    elif family == "dupload":
-        final = bypass_dupload(s, short, notify)
-    else:
-        go_page, html = walk_arolinks(s, short, notify)
-        notify(f"[aro] go page: {go_page[:70]}")
-        final = kill(s, go_page, html, host="arolinks.com", notify=notify)
-        visit_final(s, final, "arolinks.com", notify)
+    try:
+        if family == "vipshort":
+            go_page = walk_vipshort(s, short, notify)
+            notify(f"[vip] go page: {go_page[:70]}")
+            r = s.get(go_page, timeout=25, headers={"Referer": BLOG})
+            final = kill(s, go_page, r.text, host="m.vipshort.in", notify=notify)
+            visit_final(s, final, "m.vipshort.in", notify)
+        elif family == "dupload":
+            final = bypass_dupload(s, short, notify)
+        else:
+            go_page, html = walk_arolinks(s, short, notify)
+            notify(f"[aro] go page: {go_page[:70]}")
+            final = kill(s, go_page, html, host="arolinks.com", notify=notify)
+            visit_final(s, final, "arolinks.com", notify)
+        return final
 
-    return final
+    except Exception as e:
+        # Auto-remove proxy if it failed on vipshort
+        if family == "vipshort" and chosen_proxy and used_from_pool:
+            proxy_manager.remove(chosen_proxy)
+            notify(f"[vip] ⚠️ Proxy {mask_proxy(chosen_proxy)} failed. Auto-removed from pool! ({proxy_manager.count()} left)")
+        raise
 
 
 # ============================================================
-# TELEGRAM LIVE UPDATER
+# TELEGRAM LIVE UPDATER (Premium UI)
 # ============================================================
+
+SPINNERS = ["⏳", "⚙️", "🔄", "🛰️", "⚡"]
 
 class TelegramLiveUpdater:
-    def __init__(self, bot: telebot.TeleBot, chat_id: int, message_id: int, original_url: str):
+    def __init__(self, bot: telebot.TeleBot, chat_id: int, message_id: int, original_url: str, start_time: float):
         self.bot = bot
         self.chat_id = chat_id
         self.message_id = message_id
         self.original_url = original_url
+        self.start_time = start_time
         self.logs = []
         self.last_edit = 0.0
+        self.spinner_idx = 0
         self.lock = threading.Lock()
 
     def update(self, line: str):
@@ -365,16 +643,24 @@ class TelegramLiveUpdater:
             self.logs.append(line)
             recent = self.logs[-5:]
             now = time.time()
-            if now - self.last_edit >= 1.6:
+            if now - self.last_edit >= 1.5:
                 self.last_edit = now
-                self._send_edit("\n".join(recent))
+                self.spinner_idx = (self.spinner_idx + 1) % len(SPINNERS)
+                elapsed = time.perf_counter() - self.start_time
+                self._send_edit("\n".join(recent), elapsed)
 
-    def _send_edit(self, log_snippet: str):
+    def _send_edit(self, log_snippet: str, elapsed: float):
+        icon = SPINNERS[self.spinner_idx]
         text = (
-            f"⚡ <b>Bypassing Link...</b>\n"
-            f"🔗 <code>{self.original_url}</code>\n\n"
-            f"<b>Terminal Progress:</b>\n"
-            f"<pre>{log_snippet}</pre>"
+            f"╭━━━━〔 ⚡ <b>BYPASSING IN PROGRESS...</b> 〕━━━━╮\n\n"
+            f"<blockquote>🔗 <b>Target Link:</b>\n"
+            f"<code>{self.original_url}</code></blockquote>\n\n"
+            f"📡 <b>Live Telemetry:</b>\n"
+            f"<pre>{log_snippet}</pre>\n\n"
+            f"╭─ 📊 <b>Status</b>\n"
+            f"├ {icon} <b>Elapsed :</b> <code>{elapsed:.1f}s</code>\n"
+            f"╰ 👨‍💻 <b>Developer:</b> <b>{DEVELOPER}</b>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
         )
         try:
             self.bot.edit_message_text(
@@ -388,45 +674,67 @@ class TelegramLiveUpdater:
 
     def finish(self, final_url: str, elapsed: float):
         text = (
-            f"real : {self.original_url}\n"
-            f"developer : {DEVELOPER}\n"
-            f"finallink : {final_url}\n"
-            f"time : {elapsed:.2f}s"
+            f"╭━━━━〔 ⚡ <b>BYPASS SUCCESSFUL</b> 〕━━━━╮\n\n"
+            f"<blockquote>🔗 <b>Original URL:</b>\n"
+            f"<code>{self.original_url}</code></blockquote>\n\n"
+            f"<blockquote>🎯 <b>Final Destination:</b>\n"
+            f"<code>{final_url}</code></blockquote>\n\n"
+            f"╭─ 📊 <b>Execution Details</b>\n"
+            f"├ ⏱ <b>Time Taken :</b> <code>{elapsed:.2f}s</code>\n"
+            f"├ 🛡 <b>Engine     :</b> <code>TLS Impersonation v2</code>\n"
+            f"╰ 👨‍💻 <b>Developer  :</b> <b>{DEVELOPER}</b>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯"
         )
-        markup = types.InlineKeyboardMarkup()
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        buttons = []
         if final_url.startswith("http"):
-            markup.add(types.InlineKeyboardButton("🔗 Open Final Link", url=final_url))
+            buttons.append(types.InlineKeyboardButton("🚀 Open Final Link", url=final_url))
+        dev_handle = DEVELOPER.lstrip("@")
+        buttons.append(types.InlineKeyboardButton("👨‍💻 Developer", url=f"https://t.me/{dev_handle}"))
+        markup.add(*buttons)
+
         try:
             self.bot.edit_message_text(
                 text,
                 chat_id=self.chat_id,
                 message_id=self.message_id,
-                reply_markup=markup
+                reply_markup=markup,
+                parse_mode="HTML"
             )
         except Exception:
             try:
-                self.bot.send_message(self.chat_id, text, reply_markup=markup)
+                self.bot.send_message(self.chat_id, text, reply_markup=markup, parse_mode="HTML")
             except Exception:
                 pass
 
     def error(self, err_msg: str, elapsed: float):
         text = (
-            f"❌ <b>Bypass Failed</b>\n\n"
-            f"real : {self.original_url}\n"
-            f"developer : {DEVELOPER}\n"
-            f"error : {err_msg}\n"
-            f"time : {elapsed:.2f}s"
+            f"╭━━━━〔 ❌ <b>BYPASS FAILED</b> 〕━━━━╮\n\n"
+            f"<blockquote>🔗 <b>Target Link:</b>\n"
+            f"<code>{self.original_url}</code></blockquote>\n\n"
+            f"<blockquote>⚠️ <b>Error Details:</b>\n"
+            f"<code>{err_msg}</code></blockquote>\n\n"
+            f"╭─ 📊 <b>Execution Details</b>\n"
+            f"├ ⏱ <b>Time Taken :</b> <code>{elapsed:.2f}s</code>\n"
+            f"╰ 👨‍💻 <b>Developer  :</b> <b>{DEVELOPER}</b>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
+            f"💡 <i>Tip: The link may be dead, or the shortener may require a proxy.</i>"
         )
+        markup = types.InlineKeyboardMarkup()
+        dev_handle = DEVELOPER.lstrip("@")
+        markup.add(types.InlineKeyboardButton("👨‍💻 Contact Dev", url=f"https://t.me/{dev_handle}"))
+
         try:
             self.bot.edit_message_text(
                 text,
                 chat_id=self.chat_id,
                 message_id=self.message_id,
+                reply_markup=markup,
                 parse_mode="HTML"
             )
         except Exception:
             try:
-                self.bot.send_message(self.chat_id, text, parse_mode="HTML")
+                self.bot.send_message(self.chat_id, text, reply_markup=markup, parse_mode="HTML")
             except Exception:
                 pass
 
@@ -439,7 +747,7 @@ def start_health_server():
     """Runs a tiny HTTP server on $PORT to satisfy Railway / cloud health checks."""
     port_str = os.environ.get("PORT")
     if not port_str:
-        return  # If running in local or pure worker mode without $PORT, skip
+        return
 
     try:
         port = int(port_str)
@@ -478,34 +786,271 @@ def setup_bot(token: str):
     @bot.message_handler(commands=["start", "help"])
     def cmd_start(msg):
         welcome = (
-            f"👋 <b>Welcome to MasterBypass Bot!</b>\n\n"
-            f"Send me any link from:\n"
-            f"• <code>arolinks.com</code>\n"
-            f"• <code>link.vipshort.in</code> (or bare slug)\n"
-            f"• <code>dupload.net / dupload.xyz</code>\n\n"
-            f"⚡ <i>I will bypass it and show live terminal progress!</i>\n\n"
-            f"👨‍💻 Developer: <b>{DEVELOPER}</b>"
+            f"╭━━━━〔 ⚡ <b>MASTER BYPASS BOT</b> 〕━━━━╮\n\n"
+            f"🚀 <i>Instant Link Shortener Bypasser</i>\n"
+            f"Skips countdown timers, gateway loops, and ads!\n\n"
+            f"╭─ 💎 <b>Supported Networks</b>\n"
+            f"├ 🌐 <code>arolinks.com</code> (multi-lap gateway — direct)\n"
+            f"├ 🔗 <code>vipshort.in</code> (classic + search-hop — proxied)\n"
+            f"╰ 📦 <code>dupload.net / xyz</code> (direct CDN)\n\n"
+            f"╭─ 🛡️ <b>Proxy Management</b>\n"
+            f"├ ➕ <code>/addproxy &lt;proxy&gt;</code> - Check & add live proxy\n"
+            f"├ 📁 <b>Send .txt file</b> - Fast threaded bulk scanner\n"
+            f"├ 📊 <code>/proxies</code> - View active pool count\n"
+            f"╰ 🗑️ <code>/clearproxies</code> - Reset proxy pool\n\n"
+            f"╭─ 📖 <b>How to Use</b>\n"
+            f"├ Send any link directly to this chat\n"
+            f"╰ <i>Note: Proxies are used for vipshorts & auto-removed if dead!</i>\n\n"
+            f"╭─ 👨‍💻 <b>Author</b>\n"
+            f"╰ <b>Developer:</b> <b>{DEVELOPER}</b>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯"
         )
-        bot.reply_to(msg, welcome, parse_mode="HTML")
-
-    def handle_link_task(chat_id, raw_url, proxy=None):
-        start_time = time.perf_counter()
-        initial_text = (
-            f"⚡ <b>Bypassing Link...</b>\n"
-            f"🔗 <code>{raw_url}</code>\n\n"
-            f"<b>Terminal Progress:</b>\n"
-            f"<pre>[*] Initializing TLS session...</pre>"
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        dev_handle = DEVELOPER.lstrip("@")
+        markup.add(
+            types.InlineKeyboardButton("👨‍💻 Developer Profile", url=f"https://t.me/{dev_handle}")
         )
-        status_msg = bot.send_message(chat_id, initial_text, parse_mode="HTML")
-        updater = TelegramLiveUpdater(bot, chat_id, status_msg.message_id, raw_url)
+        bot.reply_to(msg, welcome, reply_markup=markup, parse_mode="HTML")
 
-        # Proxy fallback: explicitly passed, or PROXY env var
-        chosen_proxy = proxy or os.environ.get("PROXY", "").strip() or None
-        if chosen_proxy:
-            chosen_proxy = parse_proxy_any(chosen_proxy)
+    @bot.message_handler(commands=["addproxy"])
+    def cmd_addproxy(msg):
+        text = (msg.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            bot.reply_to(
+                msg,
+                "⚠️ <b>Usage:</b>\n<code>/addproxy ip:port</code>\nor\n<code>/addproxy ip:port:user:pass</code>\nor\n<code>/addproxy http://user:pass@host:port</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        raw_proxy = parts[1].strip()
+        parsed = parse_proxy_any(raw_proxy)
+        if not parsed:
+            bot.reply_to(msg, "❌ <b>Invalid proxy format!</b>\nPlease provide a valid IP:Port or URL.", parse_mode="HTML")
+            return
+
+        masked = mask_proxy(parsed)
+        status_msg = bot.reply_to(
+            msg,
+            f"╭━━━━〔 🔍 <b>PROXY CHECK</b> 〕━━━━╮\n\n"
+            f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
+            f"⏳ <i>Testing connectivity, latency & rotation async...</i>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
+            parse_mode="HTML"
+        )
+
+        def check_worker():
+            res = check_proxy_live(parsed, timeout=6)
+            if res.get("live"):
+                p_type = res.get("type", "Static")
+                type_icon = "🔄" if p_type == "Rotating" else "⚡"
+                latency_ms = int(res.get("latency", 0.0) * 1000)
+                proxy_manager.add(
+                    parsed,
+                    p_type=p_type,
+                    latency=res.get("latency", 0.0),
+                    ip=res.get("ip", ""),
+                    protocol=res.get("protocol", "HTTP")
+                )
+                stats = proxy_manager.get_stats()
+                card = (
+                    f"╭━━━━〔 ✅ <b>PROXY VERIFIED & ADDED</b> 〕━━━━╮\n\n"
+                    f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
+                    f"╭─ 📊 <b>Diagnostic Analysis</b>\n"
+                    f"├ 🏷 <b>Proxy Type  :</b> <code>{type_icon} {p_type}</code>\n"
+                    f"├ 🛡 <b>Protocol    :</b> <code>{res.get('protocol', 'HTTP')}</code>\n"
+                    f"├ ⚡ <b>Latency     :</b> <code>{latency_ms}ms</code>\n"
+                    f"├ 📍 <b>Exit IP     :</b> <code>{res.get('ip', 'N/A')}</code>\n"
+                    f"╰ 📦 <b>Active Pool :</b> <code>{stats['total']} ({stats['static']} Static, {stats['rotating']} Rotating)</code>\n\n"
+                    f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
+                    f"🚀 <i>Added to vipshorts active proxy pool!</i>"
+                )
+            else:
+                latency_ms = int(res.get("latency", 0.0) * 1000)
+                card = (
+                    f"╭━━━━〔 ❌ <b>PROXY DEAD / FAILED</b> 〕━━━━╮\n\n"
+                    f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
+                    f"╭─ 📊 <b>Failure Report</b>\n"
+                    f"├ ⚠️ <b>Reason   :</b> <code>{res.get('reason', 'Connection Failed')}</code>\n"
+                    f"├ ⏱ <b>Timeout  :</b> <code>{latency_ms}ms</code>\n"
+                    f"╰ 🚫 <b>Status   :</b> <code>Rejected (not added)</code>\n\n"
+                    f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
+                    f"💡 <i>Tip: Check port, credentials, or IP authorization.</i>"
+                )
+            try:
+                bot.edit_message_text(card, chat_id=msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+            except Exception:
+                bot.send_message(msg.chat.id, card, parse_mode="HTML")
+
+        threading.Thread(target=check_worker, daemon=True).start()
+
+    @bot.message_handler(commands=["proxies", "proxyinfo"])
+    def cmd_proxies(msg):
+        stats = proxy_manager.get_stats()
+        card = (
+            f"╭━━━━〔 🛡️ <b>PROXY POOL INVENTORY</b> 〕━━━━╮\n\n"
+            f"╭─ 📊 <b>Live Pool Stats</b>\n"
+            f"├ ⚡ <b>Static Dedicated :</b> <code>{stats['static']}</code>\n"
+            f"├ 🔄 <b>Rotating Proxies :</b> <code>{stats['rotating']}</code>\n"
+            f"├ 🎯 <b>Total Active     :</b> <code>{stats['total']} proxies</code>\n"
+            f"╰ 🛡 <b>Assigned Service :</b> <code>vipshort.in</code> (auto-fallback)\n\n"
+            f"╭─ 💡 <b>Management Commands</b>\n"
+            f"├ ➕ <code>/addproxy &lt;proxy&gt;</code> - Test & add single proxy\n"
+            f"├ 📁 <b>Send .txt file</b> - Fast async bulk scanner\n"
+            f"╰ 🗑️ <code>/clearproxies</code> - Reset entire pool\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+        )
+        bot.reply_to(msg, card, parse_mode="HTML")
+
+    @bot.message_handler(commands=["clearproxies"])
+    def cmd_clearproxies(msg):
+        proxy_manager.clear()
+        bot.reply_to(
+            msg,
+            "🗑️ <b>Proxy pool cleared!</b>\nAll proxies and metadata have been purged from storage.",
+            parse_mode="HTML"
+        )
+
+    @bot.message_handler(content_types=["document"])
+    def handle_document(msg):
+        doc = msg.document
+        if not doc:
+            return
+        fname = (doc.file_name or "").lower()
+        if not (fname.endswith(".txt") or (doc.mime_type and "text" in doc.mime_type)):
+            bot.reply_to(msg, "⚠️ Please send a <code>.txt</code> file containing proxies.", parse_mode="HTML")
+            return
 
         try:
-            final_link = bypass_process(raw_url, proxy_url=chosen_proxy, status_cb=updater.update)
+            file_info = bot.get_file(doc.file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            content = downloaded.decode("utf-8", errors="ignore")
+        except Exception as e:
+            bot.reply_to(msg, f"❌ Failed to download file: {e}")
+            return
+
+        lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
+        valid_proxies = []
+        for l in lines:
+            p = parse_proxy_any(l)
+            if p and p not in valid_proxies:
+                valid_proxies.append(p)
+
+        if not valid_proxies:
+            bot.reply_to(msg, "❌ <b>No valid proxies found in this file!</b>\nEnsure lines contain <code>ip:port</code> or <code>ip:port:user:pass</code>.", parse_mode="HTML")
+            return
+
+        initial_card = (
+            f"╭━━━━〔 ⚡ <b>ASYNC PROXY SCANNER</b> 〕━━━━╮\n\n"
+            f"<blockquote>📄 <b>File:</b> <code>{doc.file_name}</code>\n"
+            f"📊 <b>Total Extracted:</b> <code>{len(valid_proxies)} proxies</code>\n"
+            f"⚡ <b>Concurrency:</b> <code>25 async workers</code></blockquote>\n\n"
+            f"⏳ <i>Scanning proxies asynchronously, please wait...</i>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+        )
+        status_msg = bot.reply_to(msg, initial_card, parse_mode="HTML")
+
+        def scan_worker():
+            def on_prog(stats_dict):
+                tested = stats_dict["tested"]
+                total = stats_dict["total"]
+                pct = int((tested / total) * 100)
+                bar = make_progress_bar(tested, total)
+                avg_ms = int(stats_dict["avg_latency"] * 1000)
+
+                text = (
+                    f"╭━━━━〔 ⚡ <b>ASYNC PROXY SCANNER</b> 〕━━━━╮\n\n"
+                    f"<blockquote>📄 <b>File:</b> <code>{doc.file_name}</code>\n"
+                    f"📊 <b>Progress:</b> <code>{bar} {pct}% ({tested}/{total})</code></blockquote>\n\n"
+                    f"╭─ 📈 <b>Live Statistics</b>\n"
+                    f"├ ⚡ <b>Static Live   :</b> <code>{stats_dict['static']}</code>\n"
+                    f"├ 🔄 <b>Rotating Live :</b> <code>{stats_dict['rotating']}</code>\n"
+                    f"├ ❌ <b>Dead / Offline:</b> <code>{stats_dict['dead']}</code>\n"
+                    f"├ ⏱ <b>Avg Latency   :</b> <code>{avg_ms}ms</code>\n"
+                    f"╰ 📦 <b>Added to Pool :</b> <code>{stats_dict['live']}</code>\n\n"
+                    f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
+                    f"⏳ <i>Scanning with 25 async workers...</i>"
+                )
+                try:
+                    bot.edit_message_text(text, chat_id=msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+                except Exception:
+                    pass
+
+            async def run_pipeline():
+                return await async_scan_proxies_pipeline(valid_proxies, max_concurrency=25, on_progress=on_prog)
+
+            live_results, dead_results = asyncio.run(run_pipeline())
+
+            # Add live proxies with metadata
+            for res in live_results:
+                proxy_manager.add(
+                    res["proxy"],
+                    p_type=res.get("type", "Static"),
+                    latency=res.get("latency", 0.0),
+                    ip=res.get("ip", ""),
+                    protocol=res.get("protocol", "HTTP")
+                )
+
+            # Autoremove dead proxies if they were previously in the pool
+            pool = proxy_manager.get_all()
+            for res in dead_results:
+                p_dead = res["proxy"]
+                if p_dead in pool:
+                    proxy_manager.remove(p_dead)
+
+            pool_stats = proxy_manager.get_stats()
+            static_added = sum(1 for r in live_results if r.get("type") == "Static")
+            rotating_added = len(live_results) - static_added
+            avg_ms = int((sum(r.get("latency", 0.0) for r in live_results) / len(live_results)) * 1000) if live_results else 0
+
+            final_card = (
+                f"╭━━━━〔 🎯 <b>ASYNC SCAN COMPLETE</b> 〕━━━━╮\n\n"
+                f"<blockquote>📄 <b>File:</b> <code>{doc.file_name}</code>\n"
+                f"📊 <b>Total Processed:</b> <code>{len(valid_proxies)} proxies</code></blockquote>\n\n"
+                f"╭─ 📊 <b>Scan Results Breakdown</b>\n"
+                f"├ ⚡ <b>Static Live   :</b> <code>+{static_added} added</code>\n"
+                f"├ 🔄 <b>Rotating Live :</b> <code>+{rotating_added} added</code>\n"
+                f"├ ❌ <b>Dead Dropped  :</b> <code>{len(dead_results)} purged</code>\n"
+                f"╰ ⏱ <b>Average Speed :</b> <code>{avg_ms}ms</code>\n\n"
+                f"╭─ 📦 <b>Current Pool Inventory</b>\n"
+                f"├ ⚡ <b>Static Active  :</b> <code>{pool_stats['static']}</code>\n"
+                f"├ 🔄 <b>Rotating Active:</b> <code>{pool_stats['rotating']}</code>\n"
+                f"╰ 🎯 <b>Total in Pool  :</b> <code>{pool_stats['total']} proxies</code>\n\n"
+                f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
+                f"🚀 <i>Live proxies are actively assigned to vipshorts!</i>"
+            )
+            try:
+                bot.edit_message_text(final_card, chat_id=msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+            except Exception:
+                bot.send_message(msg.chat.id, final_card, parse_mode="HTML")
+
+        threading.Thread(target=scan_worker, daemon=True).start()
+
+    def handle_link_task(chat_id, user_msg_id, raw_url, proxy=None):
+        start_time = time.perf_counter()
+        initial_text = (
+            f"╭━━━━〔 ⚡ <b>BYPASSING IN PROGRESS...</b> 〕━━━━╮\n\n"
+            f"<blockquote>🔗 <b>Target Link:</b>\n"
+            f"<code>{raw_url}</code></blockquote>\n\n"
+            f"📡 <b>Live Telemetry:</b>\n"
+            f"<pre>[*] Initializing TLS session & persona...</pre>\n\n"
+            f"╭─ 📊 <b>Status</b>\n"
+            f"├ ⏳ <b>Elapsed :</b> <code>0.0s</code>\n"
+            f"╰ 👨‍💻 <b>Developer:</b> <b>{DEVELOPER}</b>\n\n"
+            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+        )
+        # Explicitly reply to the user's message
+        status_msg = bot.send_message(
+            chat_id,
+            initial_text,
+            reply_to_message_id=user_msg_id,
+            parse_mode="HTML"
+        )
+        updater = TelegramLiveUpdater(bot, chat_id, status_msg.message_id, raw_url, start_time)
+
+        try:
+            final_link = bypass_process(raw_url, explicit_proxy=proxy, status_cb=updater.update)
             elapsed = time.perf_counter() - start_time
             updater.finish(final_link, elapsed)
         except Exception as e:
@@ -518,7 +1063,6 @@ def setup_bot(token: str):
         if not text or text.startswith("/"):
             return
 
-        # Extract URL or slug
         tokens = text.split()
         target_link = None
         custom_proxy = None
@@ -528,7 +1072,6 @@ def setup_bot(token: str):
                 target_link = token
                 break
 
-        # Check for proxy token
         if target_link and len(tokens) > 1:
             for token in tokens:
                 if token != target_link and (":" in token or "@" in token):
@@ -536,17 +1079,19 @@ def setup_bot(token: str):
                     break
 
         if not target_link:
-            # Fallback: if it's a single word with no spaces, treat as slug
             if len(tokens) == 1 and len(tokens[0]) >= 4:
                 target_link = tokens[0]
             else:
-                bot.reply_to(msg, "⚠️ Please send a valid link (e.g. <code>https://arolinks.com/...</code>)", parse_mode="HTML")
+                bot.reply_to(
+                    msg,
+                    "⚠️ <b>Invalid Link!</b>\n\nPlease send a valid link (e.g. <code>https://arolinks.com/...</code>).",
+                    parse_mode="HTML"
+                )
                 return
 
-        # Run bypass in background thread to never block telegram polling
         threading.Thread(
             target=handle_link_task,
-            args=(msg.chat.id, target_link, custom_proxy),
+            args=(msg.chat.id, msg.message_id, target_link, custom_proxy),
             daemon=True
         ).start()
 
