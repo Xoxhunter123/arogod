@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -389,6 +390,9 @@ def normalize(link):
     m = re.match(r"(?:https?://)?(?:www\.)?vplinks?\.in/(.+?)/?$", u, re.I)
     if m:
         return "vplink", f"https://vplink.in/{m.group(1)}"
+    m = re.match(r"(?:https?://)?(?:m\.|www\.)?easysky\.in/(.+?)/?$", u, re.I)
+    if m:
+        return "easysky", f"https://m.easysky.in/{m.group(1)}"
     m = re.match(r"(?:https?://)?(?:www\.)?dupload\.(?:net|xyz)/(.+?)/?$", u, re.I)
     if m:
         return "dupload", f"https://dupload.net/{m.group(1)}"
@@ -683,6 +687,86 @@ def walk_vplink(s, short_url, notify):
     raise RuntimeError("vplink walk exceeded max hops without finding go form or destination")
 
 
+def bypass_easysky(s, short_url, notify):
+    slug = short_url.rstrip("/").split("/")[-1]
+    notify(f"[sky] target: {short_url} (slug: {slug})")
+
+    # Step 1: Initial request to m.easysky.in
+    r1 = s.get(short_url, allow_redirects=True, timeout=25)
+    notify(f"[sky] step 1: {r1.status_code} -> {r1.url[:65]}")
+
+    # Extract base64 target for step 2
+    m1 = re.search(r'name="go"\s+value="([^"]+)"', r1.text)
+    if m1:
+        try:
+            u1 = base64.b64decode(m1.group(1)).decode()
+        except Exception:
+            u1 = f"https://easy.inyourcities.in?adlinkfly=/{slug}"
+    else:
+        u1 = f"https://easy.inyourcities.in?adlinkfly=/{slug}"
+    notify(f"[sky] step 1 next hop: {u1[:65]}")
+
+    # Step 2: Request easy.inyourcities.in
+    r2 = s.get(u1, allow_redirects=True, timeout=25)
+    notify(f"[sky] step 2: {r2.status_code} -> {r2.url[:65]}")
+
+    m2 = re.search(r'name="go"\s+value="([^"]+)"', r2.text)
+    if m2:
+        try:
+            u2 = base64.b64decode(m2.group(1)).decode()
+        except Exception:
+            u2 = f"https://w.gameswow.info///{slug}"
+    else:
+        u2 = f"https://w.gameswow.info///{slug}"
+    notify(f"[sky] step 2 adlinkfly target: {u2[:65]}")
+
+    # Step 3: Forge safelink_redirect to land directly on adLinkFly go page with proper Referer
+    payload = json.dumps({"second_safelink_url": "", "safelink": u2})
+    b64_payload = base64.b64encode(payload.encode()).decode()
+    redir_url = f"https://easy.inyourcities.in/?safelink_redirect={b64_payload}"
+
+    r3 = s.get(redir_url, headers={"Referer": "https://easy.inyourcities.in/"}, allow_redirects=True, timeout=25)
+    notify(f"[sky] reached go page: {r3.url[:65]}")
+
+    if "ad_form_data" not in r3.text:
+        raise RuntimeError("Failed to land on adLinkFly go page (ad_form_data missing)")
+
+    # Step 4: Harvest form inputs
+    inputs = {}
+    for tag in re.finditer(r'<input[^>]+>', r3.text):
+        t = tag.group(0)
+        n = re.search(r'name="([^"]+)"', t)
+        v = re.search(r'value="([^"]*)"', t)
+        if n:
+            inputs[n.group(1)] = v.group(1) if v else ""
+
+    host = re.search(r"https?://([^/]+)", r3.url).group(1)
+    s.cookies.set("ab", "2", domain=host)
+    if inputs.get("_csrfToken"):
+        s.cookies.set("csrfToken", inputs["_csrfToken"], domain=host)
+
+    notify(f"[sky] waiting out countdown timer (5.2s) on {host}...")
+    time.sleep(5.2)
+
+    # Step 5: Kill shot POST /links/go
+    p = dict(inputs)
+    p["_method"] = "POST"
+    r_post = s.post(f"https://{host}/links/go", data=p, headers={
+        "Origin": f"https://{host}",
+        "Referer": r3.url,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest"
+    }, timeout=25)
+
+    j = r_post.json() if r_post.text.strip().startswith("{") else {}
+    if j.get("status") == "success" and j.get("url"):
+        final_url = j["url"]
+        notify(f"[sky] extracted final destination: {final_url[:65]}...")
+        return final_url
+
+    raise RuntimeError(f"Server rejected links/go: {r_post.text[:140]}")
+
+
 def bypass_process(link, explicit_proxy=None, proxy_url=None, status_cb=None):
     def notify(msg):
         print(msg, flush=True)
@@ -692,7 +776,7 @@ def bypass_process(link, explicit_proxy=None, proxy_url=None, status_cb=None):
     explicit_proxy = explicit_proxy or proxy_url
     family, short = normalize(link)
     if family is None:
-        raise RuntimeError(f"unrecognized link (supported: vipshort, arolinks, vplink, dupload): {short[:60]}")
+        raise RuntimeError(f"unrecognized link (supported: vipshort, arolinks, vplink, easysky, dupload): {short[:60]}")
 
     chosen_proxy = None
     used_from_pool = False
@@ -714,7 +798,7 @@ def bypass_process(link, explicit_proxy=None, proxy_url=None, status_cb=None):
             else:
                 notify("[vip] ℹ️ No proxies in pool — running direct...")
     else:
-        # arolinks, vplink & dupload: STRICTLY DIRECT! No pool proxy is used!
+        # arolinks, vplink, easysky & dupload: STRICTLY DIRECT! No pool proxy is used!
         if explicit_proxy:
             chosen_proxy = parse_proxy_any(explicit_proxy)
             notify(f"[{family[:3]}] 🛡️ Using explicit proxy: {mask_proxy(chosen_proxy)}")
@@ -741,6 +825,9 @@ def bypass_process(link, explicit_proxy=None, proxy_url=None, status_cb=None):
             go_page, html = walk_vplink(s, short, notify)
             final = kill_vplink(s, go_page, html, notify)
             visit_final(s, final, "vplink.in", notify)
+        elif family == "easysky":
+            final = bypass_easysky(s, short, notify)
+            visit_final(s, final, "w.gameswow.info", notify)
         else:
             go_page, html = walk_arolinks(s, short, notify)
             notify(f"[aro] go page: {go_page[:70]}")
@@ -929,6 +1016,7 @@ def setup_bot(token: str):
             f"├ 🌐 <code>arolinks.com</code> (multi-lap gateway — direct)\n"
             f"├ 🔗 <code>vipshort.in</code> (classic + search-hop — proxied)\n"
             f"├ ⚡ <code>vplink.in / vplinks.in</code> (multi-hop gateway — direct)\n"
+            f"├ 🌌 <code>easysky.in / m.easysky.in</code> (instant SafeLink — direct)\n"
             f"╰ 📦 <code>dupload.net / xyz</code> (direct CDN)\n\n"
             f"╭─ 🛡️ <b>Proxy Management</b>\n"
             f"├ ➕ <code>/addproxy &lt;proxy&gt;</code> - Check & add live proxy\n"
@@ -1205,7 +1293,7 @@ def setup_bot(token: str):
         custom_proxy = None
 
         for token in tokens:
-            if any(d in token.lower() for d in ("http://", "https://", "arolinks.com", "vipshort.in", "vplink.in", "vplinks.in", "dupload")):
+            if any(d in token.lower() for d in ("http://", "https://", "arolinks.com", "vipshort.in", "vplink.in", "vplinks.in", "easysky.in", "dupload")):
                 target_link = token
                 break
 
