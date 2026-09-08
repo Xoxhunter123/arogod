@@ -35,12 +35,22 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 # CONFIGURATION
 # ============================================================
 
-DEVELOPER = "@xoxhunterxd"
-OWNER_ID = int(os.environ.get("OWNER_ID", "6021047784"))
+def safe_int_env(key: str, default: int) -> int:
+    val = (os.environ.get(key) or "").strip()
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        print(f"[!] Warning: Invalid integer for env {key}='{val}', using default {default}", flush=True)
+        return default
+
+DEVELOPER = os.environ.get("DEVELOPER", "@xoxhunterxd").strip()
+OWNER_ID = safe_int_env("OWNER_ID", 6021047784)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-FORCE_CHANNEL_ID = int(os.environ.get("FORCE_CHANNEL_ID", "-1003902238678"))
-FORCE_CHANNEL_LINK = os.environ.get("FORCE_CHANNEL_LINK", "https://t.me/+9tlFEYFTyG1jODE1")
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "-1004150412297"))
+FORCE_CHANNEL_ID = safe_int_env("FORCE_CHANNEL_ID", -1003902238678)
+FORCE_CHANNEL_LINK = os.environ.get("FORCE_CHANNEL_LINK", "https://t.me/+9tlFEYFTyG1jODE1").strip()
+LOG_CHANNEL_ID = safe_int_env("LOG_CHANNEL_ID", -1004150412297)
 
 BLOG = "https://blog.gangstarnewyorkapk.com/"
 ADCADG = "insurance,online_colleges,study_abroad,finance,loan"
@@ -1520,6 +1530,11 @@ def start_health_server():
             self.end_headers()
             self.wfile.write(b"MasterBypass Telegram Bot is healthy & running on Railway!")
 
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+
         def log_message(self, format, *args):
             pass
 
@@ -1556,7 +1571,10 @@ def setup_bot(token: str):
         try:
             m = bot.get_chat_member(FORCE_CHANNEL_ID, user_id)
             return m.status in ("creator", "administrator", "member", "restricted")
-        except Exception:
+        except Exception as e:
+            err = str(e).lower()
+            if "chat not found" in err or "bot was kicked" in err or "not a member" in err or "admin" in err:
+                print(f"[!] Deployment Channel Check Warning: Bot is NOT an administrator in channel {FORCE_CHANNEL_ID}! Add bot to channel as admin. Error: {e}", flush=True)
             return False
 
     def get_force_join_card():
@@ -3118,13 +3136,19 @@ def main():
     start_health_server()
 
     bot = setup_bot(token)
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        print("[*] Webhook cleared & pending updates flushed", flush=True)
+    except Exception as e:
+        print(f"[!] Webhook cleanup note: {e}", flush=True)
+
     print(f"[*] MasterBypass Telegram Bot started successfully!")
     print(f"[*] Developer: {DEVELOPER}")
     print(f"[*] Listening for incoming messages...\n", flush=True)
 
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20)
+            bot.infinity_polling(timeout=20, long_polling_timeout=20, restart_on_change=False)
         except Exception as e:
             print(f"[!] Polling restart due to error: {e}", flush=True)
             time.sleep(3)
