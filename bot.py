@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 
 from curl_cffi import requests as cr
 from curl_cffi.requests import AsyncSession
+import logging
 import telebot
 from telebot import types
 
@@ -31,12 +32,25 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
+# Configure root logger to output to stdout so Railway/cloud displays all bot events and errors
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+telebot.logger.setLevel(logging.INFO)
+# Explicitly attach stdout handler to telebot.logger so telebot internal errors are visible in cloud logs
+_tb_stdout = logging.StreamHandler(sys.stdout)
+_tb_stdout.setLevel(logging.INFO)
+_tb_stdout.setFormatter(logging.Formatter("%(asctime)s [TeleBot] [%(levelname)s] %(message)s"))
+telebot.logger.handlers = [_tb_stdout]
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 def safe_int_env(key: str, default: int) -> int:
-    val = (os.environ.get(key) or "").strip()
+    val = (os.environ.get(key) or "").strip().strip("\"'")
     if not val:
         return default
     try:
@@ -45,11 +59,11 @@ def safe_int_env(key: str, default: int) -> int:
         print(f"[!] Warning: Invalid integer for env {key}='{val}', using default {default}", flush=True)
         return default
 
-DEVELOPER = os.environ.get("DEVELOPER", "@xoxhunterxd").strip()
+DEVELOPER = os.environ.get("DEVELOPER", "@xoxhunterxd").strip().strip("\"'")
 OWNER_ID = safe_int_env("OWNER_ID", 6021047784)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip("\"'")
 FORCE_CHANNEL_ID = safe_int_env("FORCE_CHANNEL_ID", -1003902238678)
-FORCE_CHANNEL_LINK = os.environ.get("FORCE_CHANNEL_LINK", "https://t.me/+9tlFEYFTyG1jODE1").strip()
+FORCE_CHANNEL_LINK = os.environ.get("FORCE_CHANNEL_LINK", "https://t.me/+9tlFEYFTyG1jODE1").strip().strip("\"'")
 LOG_CHANNEL_ID = safe_int_env("LOG_CHANNEL_ID", -1004150412297)
 
 BLOG = "https://blog.gangstarnewyorkapk.com/"
@@ -1557,13 +1571,118 @@ def start_health_server():
 def setup_bot(token: str):
     bot = telebot.TeleBot(token, parse_mode=None, threaded=True)
 
-    # Fetch bot username dynamically for referral links
+    # Fetch bot username dynamically and verify token
     bot_username = "Bot"
     try:
         me = bot.get_me()
         bot_username = me.username or "Bot"
-    except Exception:
-        pass
+        print(f"[*] Telegram Auth SUCCESS: @{bot_username} (Bot ID: {me.id}, Name: {me.first_name})", flush=True)
+    except Exception as e:
+        print(f"[!] CRITICAL: Telegram bot authentication failed for token! Check BOT_TOKEN: {e}", flush=True)
+
+    # Verify channel accessibility at startup
+    try:
+        chat_info = bot.get_chat(FORCE_CHANNEL_ID)
+        print(f"[*] Force-Join Channel verified: {chat_info.title} (ID: {FORCE_CHANNEL_ID})", flush=True)
+    except Exception as e:
+        print(f"[!] ATTENTION: Cannot access Force-Join Channel ({FORCE_CHANNEL_ID}): {e}", flush=True)
+        print(f"    ACTION REQUIRED: Add the bot as an ADMINISTRATOR in channel {FORCE_CHANNEL_ID}!", flush=True)
+
+    # Verify log channel accessibility at startup
+    try:
+        log_info = bot.get_chat(LOG_CHANNEL_ID)
+        print(f"[*] Silent Log Channel verified: {log_info.title} (ID: {LOG_CHANNEL_ID})", flush=True)
+    except Exception as e:
+        print(f"[!] ATTENTION: Cannot access Silent Log Channel ({LOG_CHANNEL_ID}): {e}", flush=True)
+        print(f"    ACTION REQUIRED: Add the bot as an ADMINISTRATOR in channel {LOG_CHANNEL_ID}!", flush=True)
+
+    # Bulletproof safe send/reply wrappers
+    _orig_send_message = bot.send_message
+    _orig_reply_to = bot.reply_to
+    _orig_edit_message_text = bot.edit_message_text
+
+    def safe_send_message(chat_id, text, reply_markup=None, reply_to_message_id=None, parse_mode="HTML", **kwargs):
+        try:
+            return _orig_send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                reply_to_message_id=reply_to_message_id,
+                parse_mode=parse_mode,
+                **kwargs
+            )
+        except Exception as e:
+            err = str(e).lower()
+            print(f"[!] Telegram API send error to chat {chat_id}: {e}", flush=True)
+            if ("replied" in err or "reply" in err) and reply_to_message_id:
+                try:
+                    return _orig_send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                        **kwargs
+                    )
+                except Exception as e2:
+                    print(f"[!] Retry without reply failed: {e2}", flush=True)
+            if "entities" in err or "parse" in err or "tag" in err:
+                plain_text = re.sub(r"<[^>]+>", "", str(text))
+                try:
+                    return _orig_send_message(
+                        chat_id=chat_id,
+                        text=plain_text,
+                        reply_markup=reply_markup,
+                        parse_mode=None,
+                        **kwargs
+                    )
+                except Exception as e3:
+                    print(f"[!] Fallback plain text send failed: {e3}", flush=True)
+            return None
+
+    def safe_reply_to(msg, text, reply_markup=None, parse_mode="HTML", **kwargs):
+        chat_id = msg.chat.id if hasattr(msg, "chat") else msg
+        msg_id = msg.message_id if hasattr(msg, "message_id") else None
+        return safe_send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            reply_to_message_id=msg_id,
+            parse_mode=parse_mode,
+            **kwargs
+        )
+
+    def safe_edit_message_text(text, chat_id=None, message_id=None, parse_mode="HTML", **kwargs):
+        try:
+            return _orig_edit_message_text(text, chat_id=chat_id, message_id=message_id, parse_mode=parse_mode, **kwargs)
+        except Exception as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                return None
+            if "entities" in err or "parse" in err or "tag" in err:
+                plain_text = re.sub(r"<[^>]+>", "", str(text))
+                try:
+                    return _orig_edit_message_text(plain_text, chat_id=chat_id, message_id=message_id, parse_mode=None, **kwargs)
+                except Exception:
+                    pass
+            return None
+
+    bot.send_message = safe_send_message
+    bot.reply_to = safe_reply_to
+    bot.edit_message_text = safe_edit_message_text
+
+    # Global live incoming message logging middleware
+    @bot.middleware_handler(update_types=['message', 'edited_message'])
+    def log_incoming_message(bot_instance, message):
+        uid = message.from_user.id if message.from_user else message.chat.id
+        uname = message.from_user.username if message.from_user else "N/A"
+        raw_text = message.text or message.caption or "<media/empty>"
+        print(f"[*] [INCOMING MSG] User: {uid} (@{uname}) | Chat: {message.chat.id} | Content: {raw_text[:80]!r}", flush=True)
+
+    @bot.middleware_handler(update_types=['callback_query'])
+    def log_incoming_callback(bot_instance, call):
+        uid = call.from_user.id if call.from_user else "unknown"
+        uname = call.from_user.username if call.from_user else "N/A"
+        print(f"[*] [INCOMING CALLBACK] User: {uid} (@{uname}) | Data: {call.data!r}", flush=True)
 
     def check_user_channel_member(user_id: int) -> bool:
         if user_manager.is_owner(user_id):
@@ -1947,10 +2066,17 @@ def setup_bot(token: str):
     # OWNER ADMIN COMMANDS (STRICT SILENT REJECTION FOR NON-OWNERS)
     # ========================================================
 
-    @bot.message_handler(commands=["ocmds", "ownerhelp"])
-    def cmd_ocmds(msg):
+    def check_owner_or_silent_reject(msg) -> bool:
         uid = msg.from_user.id if msg.from_user else msg.chat.id
         if not user_manager.is_owner(uid):
+            cmd_name = (msg.text or "").split()[0] if msg.text else "command"
+            print(f"[*] [SILENT IGNORE] Non-owner UID={uid} attempted owner command: {cmd_name} (Configured OWNER_ID={OWNER_ID})", flush=True)
+            return False
+        return True
+
+    @bot.message_handler(commands=["ocmds", "ownerhelp"])
+    def cmd_ocmds(msg):
+        if not check_owner_or_silent_reject(msg):
             return  # SILENT REJECTION - NEVER EXPOSE OWNER CMDS
 
         text = (
@@ -1979,9 +2105,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["add"])
     def cmd_add(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         parts = (msg.text or "").strip().split()
         if len(parts) < 3:
@@ -2029,9 +2154,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["addtime"])
     def cmd_addtime(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         parts = (msg.text or "").strip().split()
         if len(parts) < 3:
@@ -2073,9 +2197,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["rm", "remove"])
     def cmd_rm(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         parts = (msg.text or "").strip().split()
         if len(parts) < 2:
@@ -2111,9 +2234,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["addcredit"])
     def cmd_addcredit(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         parts = (msg.text or "").strip().split()
         if len(parts) < 3:
@@ -2150,9 +2272,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["deduct"])
     def cmd_deduct(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         parts = (msg.text or "").strip().split()
         if len(parts) < 3:
@@ -2180,9 +2301,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["genkey", "genkeys"])
     def cmd_genkey(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         raw = (msg.text or "").strip()
         parts = raw.split()
@@ -2318,9 +2438,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["keys"])
     def cmd_keys(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         active = user_manager.list_active_keys()
         if not active:
@@ -2354,9 +2473,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["broadcast", "bc"])
     def cmd_broadcast(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         is_reply = bool(msg.reply_to_message)
         broadcast_text = None
@@ -2475,9 +2593,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["stat", "stats"])
     def cmd_stat(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         u_stats = user_manager.get_stats()
         card = (
@@ -2507,9 +2624,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["show", "shorteners"])
     def cmd_show(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         counts = user_manager.get_shortener_counts()
         total = sum(counts.values())
@@ -2544,9 +2660,8 @@ def setup_bot(token: str):
 
     @bot.message_handler(commands=["users", "viplist"])
     def cmd_users(msg):
-        uid = msg.from_user.id if msg.from_user else msg.chat.id
-        if not user_manager.is_owner(uid):
-            return  # SILENT REJECTION
+        if not check_owner_or_silent_reject(msg):
+            return
 
         vip_list = user_manager.get_approved_list()
         if not vip_list:
@@ -3148,7 +3263,13 @@ def main():
 
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20, restart_on_change=False)
+            bot.infinity_polling(
+                timeout=20,
+                long_polling_timeout=20,
+                logger_level=logging.INFO,
+                allowed_updates=["message", "edited_message", "callback_query", "chat_member", "my_chat_member"],
+                restart_on_change=False
+            )
         except Exception as e:
             print(f"[!] Polling restart due to error: {e}", flush=True)
             time.sleep(3)
