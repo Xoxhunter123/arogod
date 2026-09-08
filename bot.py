@@ -18,7 +18,10 @@ from curl_cffi import requests as cr
 from curl_cffi.requests import AsyncSession
 import logging
 import telebot
-from telebot import types
+from telebot import types, apihelper
+
+# Enable telebot middleware support before any TeleBot instance is initialized
+apihelper.ENABLE_MIDDLEWARE = True
 
 # Ensure UTF-8 output encoding across Windows / Linux consoles
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -1671,18 +1674,21 @@ def setup_bot(token: str):
     bot.edit_message_text = safe_edit_message_text
 
     # Global live incoming message logging middleware
-    @bot.middleware_handler(update_types=['message', 'edited_message'])
-    def log_incoming_message(bot_instance, message):
-        uid = message.from_user.id if message.from_user else message.chat.id
-        uname = message.from_user.username if message.from_user else "N/A"
-        raw_text = message.text or message.caption or "<media/empty>"
-        print(f"[*] [INCOMING MSG] User: {uid} (@{uname}) | Chat: {message.chat.id} | Content: {raw_text[:80]!r}", flush=True)
+    try:
+        @bot.middleware_handler(update_types=['message', 'edited_message'])
+        def log_incoming_message(bot_instance, message):
+            uid = message.from_user.id if message.from_user else message.chat.id
+            uname = message.from_user.username if message.from_user else "N/A"
+            raw_text = message.text or message.caption or "<media/empty>"
+            print(f"[*] [INCOMING MSG] User: {uid} (@{uname}) | Chat: {message.chat.id} | Content: {raw_text[:80]!r}", flush=True)
 
-    @bot.middleware_handler(update_types=['callback_query'])
-    def log_incoming_callback(bot_instance, call):
-        uid = call.from_user.id if call.from_user else "unknown"
-        uname = call.from_user.username if call.from_user else "N/A"
-        print(f"[*] [INCOMING CALLBACK] User: {uid} (@{uname}) | Data: {call.data!r}", flush=True)
+        @bot.middleware_handler(update_types=['callback_query'])
+        def log_incoming_callback(bot_instance, call):
+            uid = call.from_user.id if call.from_user else "unknown"
+            uname = call.from_user.username if call.from_user else "N/A"
+            print(f"[*] [INCOMING CALLBACK] User: {uid} (@{uname}) | Data: {call.data!r}", flush=True)
+    except Exception as e:
+        print(f"[!] Middleware note: {e}", flush=True)
 
     def check_user_channel_member(user_id: int) -> bool:
         if user_manager.is_owner(user_id):
