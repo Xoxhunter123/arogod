@@ -1,4 +1,3 @@
-from asyncio import base_events
 import argparse
 import asyncio
 import base64
@@ -223,7 +222,7 @@ def bypass_vipshort(s, input_arg, notify):
             timeout=15,
         )
 
-        m_go = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^"'<>\s]+', r_lad.text)
+        m_go = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^\s"\'<>]+', r_lad.text)
         if m_go:
             go_page = m_go.group(0)
             notify(f"[vip] ladder bypassed instantly! go page: {go_page[:60]}...")
@@ -239,7 +238,7 @@ def bypass_vipshort(s, input_arg, notify):
                     headers={**headers_common, "Origin": blog_base.rstrip("/"), "Referer": article_url},
                     timeout=15,
                 )
-                m = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^"'<>\s]+', r_step.text)
+                m = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^\s"\'<>]+', r_step.text)
                 if m:
                     go_page = m.group(0)
                     break
@@ -341,7 +340,7 @@ def walk_arolinks(s, short_url, notify):
         if "arolinks.com" in host:
             if r.status_code in (403, 503) or "just a moment" in r.text.lower() or "challenge" in r.text.lower():
                 notify(f"[aro] ⚠️ Cloudflare Challenge on Cloud IP (HTTP {r.status_code})")
-                raise RuntimeError("Cloudflare blocked datacenter IP. Send '<url> <proxy>' to use a custom proxy.")
+                raise RuntimeError("Cloudflare challenge encountered on datacenter IP.")
 
             # Check for fallback click here anchor
             anchor_m = re.search(r'<a[^>]+href=[\'"](https?://[^\'"]+)[\'"][^>]*>\s*(?:click here|open link|continue)', r.text, re.I)
@@ -359,7 +358,7 @@ def walk_arolinks(s, short_url, notify):
         notify(f"[aro] {step}: gateway article #{articles} on {host} -> /readmore/")
         url = f"https://{host}/readmore/"
         time.sleep(random.uniform(5.0, 6.5))
-    raise RuntimeError("walk ran out of hops — IP throttled? try --proxy")
+    raise RuntimeError("walk ran out of hops — link expired or unreachable")
 
 
 def bypass_dupload(s, page_url, notify):
@@ -767,13 +766,6 @@ def bypass_process(link, status_cb=None):
         final = kill(s, go_page, html, host="arolinks.com", notify=notify)
         visit_final(s, final, "arolinks.com", notify)
     return final
-
-    except Exception as e:
-        # Auto-remove proxy if it failed on vipshort
-        if family == "vipshort" and chosen_proxy and used_from_pool:
-            proxy_manager.remove(chosen_proxy)
-            notify(f"[vip] ⚠️ Proxy {mask_proxy(chosen_proxy)} failed. Auto-removed from pool! ({proxy_manager.count()} left)")
-        raise
 
 
 # ============================================================
