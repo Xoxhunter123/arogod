@@ -147,7 +147,7 @@ def parse_vipshort_slug(arg):
 
 def resolve_vipshort_article_url(s, blog_base, myphp_html, notify):
     # Strategy 1: Fast URL slug generation from search query
-    m_search = re.search(r'google\.com/search\?q=([^\s"\'<>]+)', myphp_html)
+    m_search = re.search(r"""google\.com/search\?q=([^\s"'<>]+)""", myphp_html)
     if m_search:
         raw_q = unquote(m_search.group(1)).replace("+", " ")
         clean_title = re.sub(r'site:[^\s]+', '', raw_q, flags=re.I).strip()
@@ -222,7 +222,7 @@ def bypass_vipshort(s, input_arg, notify):
             timeout=15,
         )
 
-        m_go = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^\s"\'<>]+', r_lad.text)
+        m_go = re.search(r"""https://(?:m\.|link\.)?vipshort\.in/[^\s"'<>]+""", r_lad.text)
         if m_go:
             go_page = m_go.group(0)
             notify(f"[vip] ladder bypassed instantly! go page: {go_page[:60]}...")
@@ -238,7 +238,7 @@ def bypass_vipshort(s, input_arg, notify):
                     headers={**headers_common, "Origin": blog_base.rstrip("/"), "Referer": article_url},
                     timeout=15,
                 )
-                m = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^\s"\'<>]+', r_step.text)
+                m = re.search(r"""https://(?:m\.|link\.)?vipshort\.in/[^\s"'<>]+""", r_step.text)
                 if m:
                     go_page = m.group(0)
                     break
@@ -380,7 +380,7 @@ def bypass_dupload(s, page_url, notify):
     if r2.status_code in (301, 302, 303, 307, 308):
         return r2.headers.get("location", "").strip()
     mm = (re.search(r'href="(https?://[^"]*/files/[^"]+)"', r2.text)
-          or re.search(r'(https?://fs\d*\.dupload\.xyz/[^"\'<>\s]+)', r2.text))
+          or re.search(r"""(https?://fs\d*\.dupload\.xyz/[^\s"'<>]+)""", r2.text))
     if mm:
         return mm.group(1)
     raise RuntimeError(f"download2 said {r2.status_code}, no CDN link surfaced")
