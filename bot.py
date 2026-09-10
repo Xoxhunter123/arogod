@@ -1,3 +1,4 @@
+from asyncio import base_events
 import argparse
 import asyncio
 import base64
@@ -13,7 +14,6 @@ import time
 from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 
 from curl_cffi import requests as cr
-from curl_cffi.requests import AsyncSession
 import telebot
 from telebot import types
 
@@ -36,7 +36,6 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 DEVELOPER = "@xoxhunterxd"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-BLOG = "https://blog.gangstarnewyorkapk.com/"
 ADCADG = "insurance,online_colleges,study_abroad,finance,loan"
 SKIP_PATHS = ("about-us", "contact-us", "dmca", "privacy-policy",
               "category", "author", "feed", "wp-")
@@ -103,280 +102,6 @@ def build_session():
     return s, p["t"]
 
 
-def parse_proxy_any(spec):
-    spec = (spec or "").strip()
-    if not spec:
-        return None
-    m = re.match(r"^(https?|socks[45]h?)://(.+)$", spec, re.I)
-    scheme, rest = (m.group(1).lower(), m.group(2)) if m else ("http", spec)
-
-    def safe_auth(user, passwd):
-        u = quote(unquote(user), safe="")
-        p = quote(unquote(passwd), safe="") if passwd else ""
-        return f"{u}:{p}" if p else u
-
-    if "@" in rest:
-        userinfo, hostpart = rest.rsplit("@", 1)
-        user, _, passwd = userinfo.partition(":")
-        return f"{scheme}://{safe_auth(user, passwd)}@{hostpart}"
-    parts = rest.split(":")
-    if len(parts) == 4 and parts[0]:
-        return f"{scheme}://{safe_auth(parts[2], parts[3])}@{parts[0]}:{parts[1]}"
-    if len(parts) == 2 and parts[0]:
-        return f"{scheme}://{parts[0]}:{parts[1]}"
-    if len(parts) == 1 and parts[0]:
-        return f"{scheme}://{parts[0]}:8080"
-    return None
-
-
-def mask_proxy(p: str) -> str:
-    if not p:
-        return "None"
-    m = re.match(r"^(https?|socks[45]h?)://([^:]+):([^@]+)@(.+)$", p)
-    if m:
-        return f"{m.group(1)}://{m.group(2)}:***@{m.group(4)}"
-    return p
-
-
-def make_progress_bar(current: int, total: int, length: int = 10) -> str:
-    if total <= 0:
-        return "[░░░░░░░░░░]"
-    filled = max(0, min(length, int(length * (current / total))))
-    return f"[{'█' * filled}{'░' * (length - filled)}]"
-
-
-async def async_check_proxy(proxy_url: str, timeout: int = 5) -> dict:
-    """
-    Asynchronously probes proxy connectivity, latency, protocol, and detects
-    whether the exit IP is Rotating or Static.
-    """
-    parsed = parse_proxy_any(proxy_url)
-    if not parsed:
-        return {"live": False, "reason": "Invalid format", "proxy": proxy_url}
-
-    protocol = "SOCKS5" if "socks5" in parsed.lower() else "HTTP"
-    t0 = time.perf_counter()
-    try:
-        async with AsyncSession(
-            impersonate="chrome131",
-            proxies={"http": parsed, "https": parsed},
-            verify=False
-        ) as s:
-            r1 = await s.get("https://api.ipify.org?format=json", timeout=timeout)
-            latency = time.perf_counter() - t0
-            if r1.status_code != 200:
-                return {"live": False, "reason": f"HTTP {r1.status_code}", "proxy": parsed, "latency": latency}
-
-            ip1 = r1.json().get("ip", "") if "{" in r1.text else r1.text.strip()
-
-            # Second probe to test if IP rotates
-            proxy_type = "Static"
-            try:
-                r2 = await s.get("https://api.ipify.org?format=json", timeout=timeout)
-                ip2 = r2.json().get("ip", "") if "{" in r2.text else r2.text.strip()
-                if ip1 and ip2 and ip1 != ip2:
-                    proxy_type = "Rotating"
-            except Exception:
-                pass
-
-            return {
-                "live": True,
-                "proxy": parsed,
-                "type": proxy_type,
-                "protocol": protocol,
-                "ip": ip1,
-                "latency": latency
-            }
-    except Exception as e:
-        latency = time.perf_counter() - t0
-        err = str(e)
-        if "Failed to connect" in err or "Connection refused" in err:
-            err = "Connection Refused / Offline"
-        elif "timed out" in err or "Timeout" in err:
-            err = "Connection Timed Out"
-        elif "Proxy" in err:
-            err = "Proxy Handshake Error"
-        else:
-            err = err[:35]
-        return {"live": False, "reason": err, "proxy": parsed, "latency": latency}
-
-
-def check_proxy_live(proxy_url: str, timeout: int = 5) -> dict:
-    """Sync wrapper for async_check_proxy."""
-    try:
-        return asyncio.run(async_check_proxy(proxy_url, timeout=timeout))
-    except Exception as e:
-        return {"live": False, "reason": str(e)[:35], "proxy": proxy_url, "latency": 0.0}
-
-
-class ProxyManager:
-    """Thread-safe proxy pool with persistence and Static/Rotating metadata."""
-    def __init__(self, txt_path="proxies.txt", json_path="proxies.json"):
-        self.txt_path = txt_path
-        self.json_path = json_path
-        self.proxies = []
-        self.meta = {}
-        self.lock = threading.Lock()
-        self.load()
-
-    def load(self):
-        with self.lock:
-            self.proxies = []
-            self.meta = {}
-            if os.path.isfile(self.json_path):
-                try:
-                    with open(self.json_path, "r", encoding="utf-8") as f:
-                        self.meta = json.load(f)
-                except Exception:
-                    self.meta = {}
-
-            if os.path.isfile(self.txt_path):
-                try:
-                    with open(self.txt_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith("#"):
-                                parsed = parse_proxy_any(line)
-                                if parsed and parsed not in self.proxies:
-                                    self.proxies.append(parsed)
-                                    if parsed not in self.meta:
-                                        self.meta[parsed] = {"type": "Static", "latency": 0.0, "ip": ""}
-                    print(f"[*] Loaded {len(self.proxies)} proxies ({self.get_stats_unlocked()})", flush=True)
-                except Exception as e:
-                    print(f"[!] Could not load {self.txt_path}: {e}", flush=True)
-
-    def save(self):
-        try:
-            with open(self.txt_path, "w", encoding="utf-8") as f:
-                for p in self.proxies:
-                    f.write(f"{p}\n")
-            with open(self.json_path, "w", encoding="utf-8") as f:
-                json.dump(self.meta, f, indent=2)
-        except Exception as e:
-            print(f"[!] Warning saving proxy storage: {e}", flush=True)
-
-    def add(self, proxy_str: str, p_type: str = "Static", latency: float = 0.0, ip: str = "", protocol: str = "HTTP") -> bool:
-        parsed = parse_proxy_any(proxy_str)
-        if not parsed:
-            return False
-        with self.lock:
-            if parsed not in self.proxies:
-                self.proxies.append(parsed)
-            self.meta[parsed] = {
-                "type": p_type,
-                "latency": latency,
-                "ip": ip,
-                "protocol": protocol,
-                "updated_at": time.time()
-            }
-            self.save()
-            return True
-
-    def remove(self, proxy_str: str) -> bool:
-        parsed = parse_proxy_any(proxy_str) or proxy_str
-        with self.lock:
-            changed = False
-            if parsed in self.proxies:
-                self.proxies.remove(parsed)
-                changed = True
-            if parsed in self.meta:
-                del self.meta[parsed]
-                changed = True
-            if changed:
-                self.save()
-                return True
-        return False
-
-    def has(self, proxy_str: str) -> bool:
-        parsed = parse_proxy_any(proxy_str) or proxy_str
-        with self.lock:
-            return parsed in self.proxies
-
-    def get_random(self):
-        with self.lock:
-            if not self.proxies:
-                return None
-            # Prioritize rotating proxies if available
-            rotating = [p for p in self.proxies if self.meta.get(p, {}).get("type") == "Rotating"]
-            if rotating:
-                return random.choice(rotating)
-            return random.choice(self.proxies)
-
-    def count(self) -> int:
-        with self.lock:
-            return len(self.proxies)
-
-    def get_stats_unlocked(self) -> str:
-        total = len(self.proxies)
-        rotating = sum(1 for p in self.proxies if self.meta.get(p, {}).get("type") == "Rotating")
-        static = total - rotating
-        return f"{static} Static, {rotating} Rotating"
-
-    def get_stats(self) -> dict:
-        with self.lock:
-            total = len(self.proxies)
-            rotating = sum(1 for p in self.proxies if self.meta.get(p, {}).get("type") == "Rotating")
-            static = total - rotating
-            return {"total": total, "static": static, "rotating": rotating}
-
-    def get_all(self) -> list:
-        with self.lock:
-            return list(self.proxies)
-
-    def clear(self):
-        with self.lock:
-            self.proxies = []
-            self.meta = {}
-            self.save()
-
-
-proxy_manager = ProxyManager()
-
-
-async def async_scan_proxies_pipeline(proxy_list: list, max_concurrency: int = 25, on_progress=None):
-    """
-    High-performance async proxy pipeline with live statistics & progress bar.
-    """
-    sem = asyncio.Semaphore(max_concurrency)
-    total = len(proxy_list)
-    tested_count = 0
-    live_results = []
-    dead_results = []
-    lock = asyncio.Lock()
-    last_ui_update = 0.0
-
-    async def worker(p):
-        nonlocal tested_count, last_ui_update
-        async with sem:
-            res = await async_check_proxy(p, timeout=5)
-            async with lock:
-                tested_count += 1
-                if res.get("live"):
-                    live_results.append(res)
-                else:
-                    dead_results.append(res)
-
-                now = time.time()
-                if on_progress and (now - last_ui_update >= 1.5 or tested_count == total):
-                    last_ui_update = now
-                    static_count = sum(1 for r in live_results if r.get("type") == "Static")
-                    rotating_count = len(live_results) - static_count
-                    avg_lat = (sum(r.get("latency", 0.0) for r in live_results) / len(live_results)) if live_results else 0.0
-                    on_progress({
-                        "tested": tested_count,
-                        "total": total,
-                        "static": static_count,
-                        "rotating": rotating_count,
-                        "live": len(live_results),
-                        "dead": len(dead_results),
-                        "avg_latency": avg_lat,
-                    })
-
-    tasks = [worker(p) for p in proxy_list]
-    await asyncio.gather(*tasks)
-    return live_results, dead_results
-
-
 def normalize(link):
     u = (link or "").strip()
     if not u:
@@ -411,46 +136,177 @@ def normalize(link):
 # BYPASS LOGIC WITH LIVE STATUS CALLBACKS
 # ============================================================
 
-def walk_vipshort(s, short_url, notify):
-    r = s.get(short_url, timeout=25)
-    notify(f"[vip] {r.status_code} -> {r.url[:70]}")
-    if "myphp" not in r.url:
-        raise RuntimeError("expected the blog myphp hop — funnel layout changed?")
+def parse_vipshort_slug(arg):
+    arg = (arg or "").strip()
+    m = re.search(r"(?:link\.|m\.)?vipshort\.in/([a-zA-Z0-9_-]+)", arg)
+    if m:
+        return m.group(1)
+    if re.match(r"^[a-zA-Z0-9_-]+$", arg):
+        return arg
+    return arg.rstrip("/").split("/")[-1].split("?")[0]
 
-    if not re.search(r"[?&]p=\d", r.url):
-        notify("[vip] search-hop variant detected — swapping slug via ri.php")
-        time.sleep(random.uniform(1.5, 3.0))
-        s.get(BLOG, timeout=25, headers={"Referer": r.url})
-        r2 = s.get("https://open2get.in/ri.php", timeout=25, headers={"Referer": BLOG})
-        m = re.search(r'(?:window|document)\.location(?:\.href)?\s*=\s*[\'"]'
-                      r'(https://blog\.gangstarnewyorkapk\.com/myphp\.php[^\'"]+)', r2.text)
-        if not m:
-            raise RuntimeError("ri.php didn't reveal the internal slug")
-        notify(f"[vip] internal slug hop: {m.group(1)[:60]}...")
-        time.sleep(random.uniform(1.0, 2.0))
-        return walk_vipshort(s, m.group(1), notify)
 
-    time.sleep(random.uniform(2.5, 5.0))
-    r = s.get(BLOG, timeout=25, headers={"Referer": r.url})
-    if "wpsafelink" not in r.text.lower():
-        raise RuntimeError("wpsafelink widget not injected — IP flagged")
-    rum_beacon(s, "blog.gangstarnewyorkapk.com", BLOG)
-    posts = [u for u in re.findall(r'href="(' + re.escape(BLOG) + r'[a-z0-9-]+/)"', r.text)
-             if not any(k in u for k in SKIP_PATHS)]
-    if not posts:
-        raise RuntimeError("no ladder post permalink on the blog homepage")
-    notify(f"[vip] ladder post: {posts[0][:60]}...")
+def resolve_vipshort_article_url(s, blog_base, myphp_html, notify):
+    # Strategy 1: Fast URL slug generation from search query
+    m_search = re.search(r'google\.com/search\?q=([^\s"\'<>]+)', myphp_html)
+    if m_search:
+        raw_q = unquote(m_search.group(1)).replace("+", " ")
+        clean_title = re.sub(r'site:[^\s]+', '', raw_q, flags=re.I).strip()
+        slug = re.sub(r'[^a-zA-Z0-9]+', '-', clean_title.lower()).strip('-')
+        if slug:
+            candidate = f"{blog_base.rstrip('/')}/{slug}/"
+            return candidate
+        return blog_base.rstrip("/") + "/"
 
-    for vip in ("4", "3", "2"):
-        time.sleep(random.uniform(3.5, 6.0))
-        data = {"vip1": vip} if vip != "2" else {"vip1": "2", "g-recaptcha-response": ""}
-        r = s.post(posts[0], data=data,
-                   headers={"Origin": BLOG.rstrip("/"), "Referer": BLOG}, timeout=25)
-        m = re.search(r'https://m\.vipshort\.in/[^"\'<>\s]+', r.text)
-        if m:
-            notify(f"[vip] ladder paid at vip1={vip}")
-            return m.group(0)
-    raise RuntimeError("ladder walked clean — no go-page URL")
+    # Strategy 2: Blog homepage fallback
+    notify("[vip] searching blog homepage for active ladder post...")
+    try:
+        r_home = s.get(blog_base, headers={"Referer": "https://www.google.com/"}, timeout=15)
+        links = re.findall(r'href="(' + re.escape(blog_base.rstrip("/")) + r'/[a-z0-9-]+/)"', r_home.text)
+        skip = ("about-us", "contact-us", "dmca", "privacy-policy", "category", "author", "feed", "wp-")
+        valid_posts = [l for l in set(links) if not any(k in l for k in skip)]
+        if valid_posts:
+            return valid_posts[0]
+    except Exception:
+        pass
+
+    return blog_base.rstrip("/") + "/"
+
+
+def bypass_vipshort(s, input_arg, notify):
+    slug = parse_vipshort_slug(input_arg)
+    short_url = f"https://link.vipshort.in/{slug}"
+    notify(f"[vip] target shortlink: {short_url}")
+
+    headers_common = {
+        "User-Agent": s.headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": s.headers.get("Accept-Language", "en-US,en;q=0.9"),
+    }
+
+    # Step 1: Hop 1 - Get dynamic blog redirect
+    notify(f"[vip] querying {short_url}...")
+    r1 = s.get(short_url, headers=headers_common, allow_redirects=False, timeout=15)
+    loc1 = r1.headers.get("location") or r1.headers.get("Location")
+
+    if not loc1 and "m.vipshort.in" in r1.url:
+        go_page = r1.url
+        blog_base = "https://link.vipshort.in/"
+        article_url = blog_base
+    elif not loc1:
+        raise RuntimeError(f"expected redirect from {short_url}, got status {r1.status_code}")
+    else:
+        if "href.li/?" in loc1:
+            loc1 = loc1.split("href.li/?")[-1]
+
+        parsed_loc = urlparse(loc1)
+        blog_base = f"{parsed_loc.scheme}://{parsed_loc.netloc}/"
+        notify(f"[vip] target blog: {blog_base}")
+
+        # Step 2: Hop 2 - Visit myphp.php to register session cookies
+        r_myphp = s.get(loc1, headers={**headers_common, "Referer": "https://link.vipshort.in/"}, timeout=15)
+
+        # Step 3: Direct article resolution
+        article_url = resolve_vipshort_article_url(s, blog_base, r_myphp.text, notify)
+        notify(f"[vip] article target: {article_url}")
+
+        # Step 4: Fast-path direct jump to vip1=4
+        notify("[vip] fast-path: submitting vip1=4 directly...")
+        r_lad = s.post(
+            article_url,
+            data={"vip1": "4", "g-recaptcha-response": ""},
+            headers={
+                **headers_common,
+                "Origin": blog_base.rstrip("/"),
+                "Referer": article_url,
+            },
+            timeout=15,
+        )
+
+        m_go = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^"'<>\s]+', r_lad.text)
+        if m_go:
+            go_page = m_go.group(0)
+            notify(f"[vip] ladder bypassed instantly! go page: {go_page[:60]}...")
+        else:
+            notify("[vip] direct jump unfulfilled, stepping ladder (vip1: 2 -> 3 -> 4)...")
+            current_vip = "2"
+            go_page = None
+            for _ in range(4):
+                time.sleep(1.0)
+                r_step = s.post(
+                    article_url,
+                    data={"vip1": current_vip, "g-recaptcha-response": ""},
+                    headers={**headers_common, "Origin": blog_base.rstrip("/"), "Referer": article_url},
+                    timeout=15,
+                )
+                m = re.search(r'https://(?:m\.|link\.)?vipshort\.in/[^"'<>\s]+', r_step.text)
+                if m:
+                    go_page = m.group(0)
+                    break
+                m_next = re.search(r'name="vip1"\s+value="([^"]+)"', r_step.text)
+                current_vip = m_next.group(1) if m_next else str(int(current_vip) + 1)
+
+            if not go_page:
+                raise RuntimeError("failed to obtain go-page URL from blog ladder")
+
+    # Step 5: Load go page on m.vipshort.in & harvest form
+    notify("[vip] fetching adLinkFly form...")
+    r_go = s.get(go_page, headers={**headers_common, "Referer": article_url}, timeout=15)
+
+    inputs = {}
+    for tag in re.finditer(r'<input[^>]+>', r_go.text):
+        t = tag.group(0)
+        n = re.search(r'name="([^"]+)"', t)
+        v = re.search(r'value="([^"]*)"', t)
+        if n:
+            inputs[n.group(1)] = v.group(1) if v else ""
+
+    if "ad_form_data" not in inputs:
+        raise RuntimeError("go page layout missing ad_form_data token")
+
+    target_host = "m.vipshort.in"
+    s.cookies.set("ab", "2", domain=target_host)
+    if inputs.get("_csrfToken"):
+        s.cookies.set("csrfToken", inputs["_csrfToken"], domain=target_host)
+
+    m_counter = re.search(r'"counter_value":\s*"(\d+)"', r_go.text)
+    counter = int(m_counter.group(1)) if m_counter else 5
+    wait_time = counter + 0.8
+
+    notify(f"[vip] waiting countdown timer: {wait_time:.1f}s...")
+    time.sleep(wait_time)
+
+    # Step 6: Post /links/go
+    payload = dict(inputs)
+    payload["_method"] = "POST"
+
+    post_headers = {
+        "Origin": f"https://{target_host}",
+        "Referer": go_page,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+
+    notify("[vip] submitting final kill shot to /links/go...")
+    r_kill = s.post(
+        f"https://{target_host}/links/go",
+        data=payload,
+        headers=post_headers,
+        timeout=15,
+    )
+
+    try:
+        res = r_kill.json()
+    except Exception:
+        raise RuntimeError(f"non-JSON response from links/go: {r_kill.text[:140]}")
+
+    if res.get("status") == "success" and res.get("url"):
+        final_dest = res["url"]
+        notify(f"[vip] destination resolved: {final_dest[:70]}...")
+        return final_dest
+    else:
+        raise RuntimeError(f"bypass failed: {r_kill.text[:140]}")
 
 
 def js_hop(html):
@@ -874,79 +730,43 @@ def bypass_shrinkme(s, short_url, notify):
     raise RuntimeError(f"Shrinkme links/go rejected: {r_post.text[:140]}")
 
 
-def bypass_process(link, explicit_proxy=None, proxy_url=None, status_cb=None):
+def bypass_process(link, status_cb=None):
     def notify(msg):
         print(msg, flush=True)
         if status_cb:
             status_cb(msg)
 
-    explicit_proxy = explicit_proxy or proxy_url
     family, short = normalize(link)
     if family is None:
         raise RuntimeError(f"unrecognized link (supported: vipshort, arolinks, vplink, easysky, monteolympus, shrinkme, dupload): {short[:60]}")
 
-    chosen_proxy = None
-    used_from_pool = False
-
-    # ONLY USE PROXY FOR VIPSHORT!
-    if family == "vipshort":
-        if explicit_proxy:
-            chosen_proxy = parse_proxy_any(explicit_proxy)
-            notify(f"[vip] 🛡️ Using explicit proxy: {mask_proxy(chosen_proxy)}")
-        else:
-            pool_proxy = proxy_manager.get_random()
-            if pool_proxy:
-                chosen_proxy = pool_proxy
-                used_from_pool = True
-                notify(f"[vip] 🛡️ Selected proxy from pool ({proxy_manager.count()} total): {mask_proxy(chosen_proxy)}")
-            elif os.environ.get("PROXY"):
-                chosen_proxy = parse_proxy_any(os.environ.get("PROXY"))
-                notify(f"[vip] 🛡️ Using env PROXY: {mask_proxy(chosen_proxy)}")
-            else:
-                notify("[vip] ℹ️ No proxies in pool — running direct...")
-    else:
-        # arolinks, vplink, easysky, monteolympus, shrinkme & dupload: STRICTLY DIRECT! No pool proxy is used!
-        if explicit_proxy:
-            chosen_proxy = parse_proxy_any(explicit_proxy)
-            notify(f"[{family[:3]}] 🛡️ Using explicit proxy: {mask_proxy(chosen_proxy)}")
-        else:
-            chosen_proxy = None
-            notify(f"[{family[:3]}] ⚡ Direct connection (proxy disabled for {family})")
-
     s, persona = build_session()
-    if chosen_proxy:
-        s.proxies = {"http": chosen_proxy, "https": chosen_proxy}
+    notify(f"[*] routing: {family} ({persona}) [direct]")
 
-    notify(f"[*] routing: {family} ({persona})")
-
-    try:
-        if family == "vipshort":
-            go_page = walk_vipshort(s, short, notify)
-            notify(f"[vip] go page: {go_page[:70]}")
-            r = s.get(go_page, timeout=25, headers={"Referer": BLOG})
-            final = kill(s, go_page, r.text, host="m.vipshort.in", notify=notify)
-            visit_final(s, final, "m.vipshort.in", notify)
-        elif family == "dupload":
-            final = bypass_dupload(s, short, notify)
-        elif family == "vplink":
-            go_page, html = walk_vplink(s, short, notify)
-            final = kill_vplink(s, go_page, html, notify)
-            visit_final(s, final, "vplink.in", notify)
-        elif family == "easysky":
-            final = bypass_easysky(s, short, notify)
-            visit_final(s, final, "w.gameswow.info", notify)
-        elif family == "monteolympus":
-            final = bypass_monteolympus(s, short, notify)
-            visit_final(s, final, "monteolympus.com", notify)
-        elif family == "shrinkme":
-            final = bypass_shrinkme(s, short, notify)
-            visit_final(s, final, "en.mrproblogger.com", notify)
-        else:
-            go_page, html = walk_arolinks(s, short, notify)
-            notify(f"[aro] go page: {go_page[:70]}")
-            final = kill(s, go_page, html, host="arolinks.com", notify=notify)
-            visit_final(s, final, "arolinks.com", notify)
-        return final
+    if family == "vipshort":
+        final = bypass_vipshort(s, short, notify)
+        visit_final(s, final, "m.vipshort.in", notify)
+    elif family == "dupload":
+        final = bypass_dupload(s, short, notify)
+    elif family == "vplink":
+        go_page, html = walk_vplink(s, short, notify)
+        final = kill_vplink(s, go_page, html, notify)
+        visit_final(s, final, "vplink.in", notify)
+    elif family == "easysky":
+        final = bypass_easysky(s, short, notify)
+        visit_final(s, final, "w.gameswow.info", notify)
+    elif family == "monteolympus":
+        final = bypass_monteolympus(s, short, notify)
+        visit_final(s, final, "monteolympus.com", notify)
+    elif family == "shrinkme":
+        final = bypass_shrinkme(s, short, notify)
+        visit_final(s, final, "en.mrproblogger.com", notify)
+    else:
+        go_page, html = walk_arolinks(s, short, notify)
+        notify(f"[aro] go page: {go_page[:70]}")
+        final = kill(s, go_page, html, host="arolinks.com", notify=notify)
+        visit_final(s, final, "arolinks.com", notify)
+    return final
 
     except Exception as e:
         # Auto-remove proxy if it failed on vipshort
@@ -1054,7 +874,7 @@ class TelegramLiveUpdater:
             f"├ ⏱ <b>Time Taken :</b> <code>{elapsed:.2f}s</code>\n"
             f"╰ 👨‍💻 <b>Developer  :</b> <b>{DEVELOPER}</b>\n\n"
             f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
-            f"💡 <i>Tip: The link may be dead, or the shortener may require a proxy.</i>"
+            f"💡 <i>Tip: The link may be expired, dead, or invalid.</i>"
         )
         markup = types.InlineKeyboardMarkup()
         dev_handle = DEVELOPER.lstrip("@")
@@ -1127,20 +947,15 @@ def setup_bot(token: str):
             f"Skips countdown timers, gateway loops, and ads!\n\n"
             f"╭─ 💎 <b>Supported Networks</b>\n"
             f"├ 🌐 <code>arolinks.com</code> (multi-lap gateway — direct)\n"
-            f"├ 🔗 <code>vipshort.in</code> (classic + search-hop — proxied)\n"
+            f"├ 🔗 <code>vipshort.in</code> (ultra-fast blog ladder — direct)\n"
             f"├ ⚡ <code>vplink.in / vplinks.in</code> (multi-hop gateway — direct)\n"
             f"├ 🌌 <code>easysky.in / m.easysky.in</code> (instant SafeLink — direct)\n"
             f"├ 🏛️ <code>monteolympus.com</code> (instant 8-gate skip — direct)\n"
             f"├ 🎯 <code>shrinkme.click / io</code> (mrproblogger bypass — direct)\n"
             f"╰ 📦 <code>dupload.net / xyz</code> (direct CDN)\n\n"
-            f"╭─ 🛡️ <b>Proxy Management</b>\n"
-            f"├ ➕ <code>/addproxy &lt;proxy&gt;</code> - Check & add live proxy\n"
-            f"├ 📁 <b>Send .txt file</b> - Fast threaded bulk scanner\n"
-            f"├ 📊 <code>/proxies</code> - View active pool count\n"
-            f"╰ 🗑️ <code>/clearproxies</code> - Reset proxy pool\n\n"
             f"╭─ 📖 <b>How to Use</b>\n"
-            f"├ Send any link directly to this chat\n"
-            f"╰ <i>Note: Proxies are used for vipshorts & auto-removed if dead!</i>\n\n"
+            f"├ Send any supported link directly to this chat\n"
+            f"╰ <i>Fast pure direct bypass with real-time progress!</i>\n\n"
             f"╭─ 👨‍💻 <b>Author</b>\n"
             f"╰ <b>Developer:</b> <b>{DEVELOPER}</b>\n\n"
             f"╰━━━━━━━━━━━━━━━━━━━━━━━━╯"
@@ -1152,222 +967,7 @@ def setup_bot(token: str):
         )
         bot.reply_to(msg, welcome, reply_markup=markup, parse_mode="HTML")
 
-    @bot.message_handler(commands=["addproxy"])
-    def cmd_addproxy(msg):
-        text = (msg.text or "").strip()
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            bot.reply_to(
-                msg,
-                "⚠️ <b>Usage:</b>\n<code>/addproxy ip:port</code>\nor\n<code>/addproxy ip:port:user:pass</code>\nor\n<code>/addproxy http://user:pass@host:port</code>",
-                parse_mode="HTML"
-            )
-            return
-
-        raw_proxy = parts[1].strip()
-        parsed = parse_proxy_any(raw_proxy)
-        if not parsed:
-            bot.reply_to(msg, "❌ <b>Invalid proxy format!</b>\nPlease provide a valid IP:Port or URL.", parse_mode="HTML")
-            return
-
-        masked = mask_proxy(parsed)
-        status_msg = bot.reply_to(
-            msg,
-            f"╭━━━━〔 🔍 <b>ASYNC PROXY CHECK</b> 〕━━━━╮\n\n"
-            f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
-            f"⏳ <i>Testing connectivity, latency & rotation async...</i>\n\n"
-            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
-            parse_mode="HTML"
-        )
-
-        def check_worker():
-            res = check_proxy_live(parsed, timeout=6)
-            if res.get("live"):
-                p_type = res.get("type", "Static")
-                type_icon = "🔄" if p_type == "Rotating" else "⚡"
-                latency_ms = int(res.get("latency", 0.0) * 1000)
-                proxy_manager.add(
-                    parsed,
-                    p_type=p_type,
-                    latency=res.get("latency", 0.0),
-                    ip=res.get("ip", ""),
-                    protocol=res.get("protocol", "HTTP")
-                )
-                stats = proxy_manager.get_stats()
-                card = (
-                    f"╭━━━━〔 ✅ <b>PROXY VERIFIED & ADDED</b> 〕━━━━╮\n\n"
-                    f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
-                    f"╭─ 📊 <b>Diagnostic Analysis</b>\n"
-                    f"├ 🏷 <b>Proxy Type  :</b> <code>{type_icon} {p_type}</code>\n"
-                    f"├ 🛡 <b>Protocol    :</b> <code>{res.get('protocol', 'HTTP')}</code>\n"
-                    f"├ ⚡ <b>Latency     :</b> <code>{latency_ms}ms</code>\n"
-                    f"├ 📍 <b>Exit IP     :</b> <code>{res.get('ip', 'N/A')}</code>\n"
-                    f"╰ 📦 <b>Active Pool :</b> <code>{stats['total']} ({stats['static']} Static, {stats['rotating']} Rotating)</code>\n\n"
-                    f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
-                    f"🚀 <i>Added to vipshorts active proxy pool!</i>"
-                )
-            else:
-                latency_ms = int(res.get("latency", 0.0) * 1000)
-                card = (
-                    f"╭━━━━〔 ❌ <b>PROXY DEAD / FAILED</b> 〕━━━━╮\n\n"
-                    f"<blockquote>🌐 <b>Proxy:</b>\n<code>{masked}</code></blockquote>\n\n"
-                    f"╭─ 📊 <b>Failure Report</b>\n"
-                    f"├ ⚠️ <b>Reason   :</b> <code>{res.get('reason', 'Connection Failed')}</code>\n"
-                    f"├ ⏱ <b>Timeout  :</b> <code>{latency_ms}ms</code>\n"
-                    f"╰ 🚫 <b>Status   :</b> <code>Rejected (not added)</code>\n\n"
-                    f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
-                    f"💡 <i>Tip: Check port, credentials, or IP authorization.</i>"
-                )
-            try:
-                bot.edit_message_text(card, chat_id=msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
-            except Exception:
-                bot.send_message(msg.chat.id, card, parse_mode="HTML")
-
-        threading.Thread(target=check_worker, daemon=True).start()
-
-    @bot.message_handler(commands=["proxies", "proxyinfo"])
-    def cmd_proxies(msg):
-        stats = proxy_manager.get_stats()
-        card = (
-            f"╭━━━━〔 🛡️ <b>PROXY POOL INVENTORY</b> 〕━━━━╮\n\n"
-            f"╭─ 📊 <b>Live Pool Stats</b>\n"
-            f"├ ⚡ <b>Static Dedicated :</b> <code>{stats['static']}</code>\n"
-            f"├ 🔄 <b>Rotating Proxies :</b> <code>{stats['rotating']}</code>\n"
-            f"├ 🎯 <b>Total Active     :</b> <code>{stats['total']} proxies</code>\n"
-            f"╰ 🛡 <b>Assigned Service :</b> <code>vipshort.in</code> (auto-fallback)\n\n"
-            f"╭─ 💡 <b>Management Commands</b>\n"
-            f"├ ➕ <code>/addproxy &lt;proxy&gt;</code> - Test & add single proxy\n"
-            f"├ 📁 <b>Send .txt file</b> - Fast async bulk scanner\n"
-            f"╰ 🗑️ <code>/clearproxies</code> - Reset entire pool\n\n"
-            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
-        )
-        bot.reply_to(msg, card, parse_mode="HTML")
-
-    @bot.message_handler(commands=["clearproxies"])
-    def cmd_clearproxies(msg):
-        proxy_manager.clear()
-        bot.reply_to(
-            msg,
-            "🗑️ <b>Proxy pool cleared!</b>\nAll proxies and metadata have been purged from storage.",
-            parse_mode="HTML"
-        )
-
-    @bot.message_handler(content_types=["document"])
-    def handle_document(msg):
-        doc = msg.document
-        if not doc:
-            return
-        fname = (doc.file_name or "").lower()
-        if not (fname.endswith(".txt") or (doc.mime_type and "text" in doc.mime_type)):
-            bot.reply_to(msg, "⚠️ Please send a <code>.txt</code> file containing proxies.", parse_mode="HTML")
-            return
-
-        try:
-            file_info = bot.get_file(doc.file_id)
-            downloaded = bot.download_file(file_info.file_path)
-            content = downloaded.decode("utf-8", errors="ignore")
-        except Exception as e:
-            bot.reply_to(msg, f"❌ Failed to download file: {e}")
-            return
-
-        lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
-        valid_proxies = []
-        for l in lines:
-            p = parse_proxy_any(l)
-            if p and p not in valid_proxies:
-                valid_proxies.append(p)
-
-        if not valid_proxies:
-            bot.reply_to(msg, "❌ <b>No valid proxies found in this file!</b>\nEnsure lines contain <code>ip:port</code> or <code>ip:port:user:pass</code>.", parse_mode="HTML")
-            return
-
-        initial_card = (
-            f"╭━━━━〔 ⚡ <b>ASYNC PROXY SCANNER</b> 〕━━━━╮\n\n"
-            f"<blockquote>📄 <b>File:</b> <code>{doc.file_name}</code>\n"
-            f"📊 <b>Total Extracted:</b> <code>{len(valid_proxies)} proxies</code>\n"
-            f"⚡ <b>Concurrency:</b> <code>25 async workers</code></blockquote>\n\n"
-            f"⏳ <i>Scanning proxies asynchronously, please wait...</i>\n\n"
-            f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
-        )
-        status_msg = bot.reply_to(msg, initial_card, parse_mode="HTML")
-
-        def scan_worker():
-            def on_prog(stats_dict):
-                tested = stats_dict["tested"]
-                total = stats_dict["total"]
-                pct = int((tested / total) * 100)
-                bar = make_progress_bar(tested, total)
-                avg_ms = int(stats_dict["avg_latency"] * 1000)
-
-                text = (
-                    f"╭━━━━〔 ⚡ <b>ASYNC PROXY SCANNER</b> 〕━━━━╮\n\n"
-                    f"<blockquote>📄 <b>File:</b> <code>{doc.file_name}</code>\n"
-                    f"📊 <b>Progress:</b> <code>{bar} {pct}% ({tested}/{total})</code></blockquote>\n\n"
-                    f"╭─ 📈 <b>Live Statistics</b>\n"
-                    f"├ ⚡ <b>Static Live   :</b> <code>{stats_dict['static']}</code>\n"
-                    f"├ 🔄 <b>Rotating Live :</b> <code>{stats_dict['rotating']}</code>\n"
-                    f"├ ❌ <b>Dead / Offline:</b> <code>{stats_dict['dead']}</code>\n"
-                    f"├ ⏱ <b>Avg Latency   :</b> <code>{avg_ms}ms</code>\n"
-                    f"╰ 📦 <b>Added to Pool :</b> <code>{stats_dict['live']}</code>\n\n"
-                    f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
-                    f"⏳ <i>Scanning with 25 async workers...</i>"
-                )
-                try:
-                    bot.edit_message_text(text, chat_id=msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
-                except Exception:
-                    pass
-
-            async def run_pipeline():
-                return await async_scan_proxies_pipeline(valid_proxies, max_concurrency=25, on_progress=on_prog)
-
-            live_results, dead_results = asyncio.run(run_pipeline())
-
-            # Add live proxies with metadata
-            for res in live_results:
-                proxy_manager.add(
-                    res["proxy"],
-                    p_type=res.get("type", "Static"),
-                    latency=res.get("latency", 0.0),
-                    ip=res.get("ip", ""),
-                    protocol=res.get("protocol", "HTTP")
-                )
-
-            # Autoremove dead proxies if they were previously in the pool
-            pool = proxy_manager.get_all()
-            for res in dead_results:
-                p_dead = res["proxy"]
-                if p_dead in pool:
-                    proxy_manager.remove(p_dead)
-
-            pool_stats = proxy_manager.get_stats()
-            static_added = sum(1 for r in live_results if r.get("type") == "Static")
-            rotating_added = len(live_results) - static_added
-            avg_ms = int((sum(r.get("latency", 0.0) for r in live_results) / len(live_results)) * 1000) if live_results else 0
-
-            final_card = (
-                f"╭━━━━〔 🎯 <b>ASYNC SCAN COMPLETE</b> 〕━━━━╮\n\n"
-                f"<blockquote>📄 <b>File:</b> <code>{doc.file_name}</code>\n"
-                f"📊 <b>Total Processed:</b> <code>{len(valid_proxies)} proxies</code></blockquote>\n\n"
-                f"╭─ 📊 <b>Scan Results Breakdown</b>\n"
-                f"├ ⚡ <b>Static Live   :</b> <code>+{static_added} added</code>\n"
-                f"├ 🔄 <b>Rotating Live :</b> <code>+{rotating_added} added</code>\n"
-                f"├ ❌ <b>Dead Dropped  :</b> <code>{len(dead_results)} purged</code>\n"
-                f"╰ ⏱ <b>Average Speed :</b> <code>{avg_ms}ms</code>\n\n"
-                f"╭─ 📦 <b>Current Pool Inventory</b>\n"
-                f"├ ⚡ <b>Static Active  :</b> <code>{pool_stats['static']}</code>\n"
-                f"├ 🔄 <b>Rotating Active:</b> <code>{pool_stats['rotating']}</code>\n"
-                f"╰ 🎯 <b>Total in Pool  :</b> <code>{pool_stats['total']} proxies</code>\n\n"
-                f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n"
-                f"🚀 <i>Live proxies are actively assigned to vipshorts!</i>"
-            )
-            try:
-                bot.edit_message_text(final_card, chat_id=msg.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
-            except Exception:
-                bot.send_message(msg.chat.id, final_card, parse_mode="HTML")
-
-        threading.Thread(target=scan_worker, daemon=True).start()
-
-    def handle_link_task(chat_id, user_msg_id, raw_url, proxy=None):
+    def handle_link_task(chat_id, user_msg_id, raw_url):
         start_time = time.perf_counter()
         initial_text = (
             f"╭━━━━〔 ⚡ <b>BYPASSING IN PROGRESS...</b> 〕━━━━╮\n\n"
@@ -1390,7 +990,7 @@ def setup_bot(token: str):
         updater = TelegramLiveUpdater(bot, chat_id, status_msg.message_id, raw_url, start_time)
 
         try:
-            final_link = bypass_process(raw_url, explicit_proxy=proxy, status_cb=updater.update)
+            final_link = bypass_process(raw_url, status_cb=updater.update)
             elapsed = time.perf_counter() - start_time
             updater.finish(final_link, elapsed)
         except Exception as e:
@@ -1405,18 +1005,11 @@ def setup_bot(token: str):
 
         tokens = text.split()
         target_link = None
-        custom_proxy = None
 
         for token in tokens:
             if any(d in token.lower() for d in ("http://", "https://", "arolinks.com", "vipshort.in", "vplink.in", "vplinks.in", "easysky.in", "monteolympus.com", "shrinkme.", "shrinke.me", "dupload")):
                 target_link = token
                 break
-
-        if target_link and len(tokens) > 1:
-            for token in tokens:
-                if token != target_link and (":" in token or "@" in token):
-                    custom_proxy = token
-                    break
 
         if not target_link:
             if len(tokens) == 1 and len(tokens[0]) >= 4:
@@ -1424,14 +1017,14 @@ def setup_bot(token: str):
             else:
                 bot.reply_to(
                     msg,
-                    "⚠️ <b>Invalid Link!</b>\n\nPlease send a valid link (e.g. <code>https://arolinks.com/...</code>).",
+                    "⚠️ <b>Invalid Link!</b>\n\nPlease send a valid link (e.g. <code>https://link.vipshort.in/...</code>).",
                     parse_mode="HTML"
                 )
                 return
 
         threading.Thread(
             target=handle_link_task,
-            args=(msg.chat.id, msg.message_id, target_link, custom_proxy),
+            args=(msg.chat.id, msg.message_id, target_link),
             daemon=True
         ).start()
 
@@ -1446,16 +1039,14 @@ def main():
     parser = argparse.ArgumentParser(description="MasterBypass Telegram Bot")
     parser.add_argument("link", nargs="?", default=None, help="Optional CLI test link")
     parser.add_argument("--token", default=None, help="Telegram Bot Token")
-    parser.add_argument("--proxy", default=None, help="Optional proxy for CLI or Bot")
     args = parser.parse_args()
 
     # CLI direct test mode if link is provided
     if args.link:
-        proxy_url = parse_proxy_any(args.proxy) if args.proxy else None
         print(f"[*] CLI Direct Bypass: {args.link}")
         start = time.perf_counter()
         try:
-            final = bypass_process(args.link, proxy_url=proxy_url)
+            final = bypass_process(args.link)
             elapsed = time.perf_counter() - start
             print(f"\nreal : {args.link}")
             print(f"developer : {DEVELOPER}")
